@@ -10,7 +10,7 @@ A Codex desktop plugin that sends scoped engineering tasks to an authenticated A
 - Antigravity CLI installed and signed in. Run `agy models` to check your available models. The router uses `%USERPROFILE%\.gemini\bin\agy.exe` by default. Launch Codex with `CODEX_ANTIGRAVITY_CLI` set to the executable path if yours is elsewhere.
 - A Git repository. Give Codex the repository root and a narrow task, for example: “Use Antigravity delegation to fix the input validation in this repo and report the verification results.”
 
-## Install
+## Install from the Codex marketplace
 
 ```powershell
 codex plugin marketplace add Ruturaj147990/codex-antigravity-router
@@ -29,5 +29,15 @@ Ask Codex to open the router dashboard to get a temporary loopback URL. Choose t
 ## Release
 
 The router includes the local browser dashboard, model selection, a configurable worker limit, worktree scheduling, verification, cancellation, and recovery. Actual time and Codex usage savings have not been benchmarked.
+
+## Prepare an official Plugins Directory package
+
+Local MCP plugins require OpenAI approval for the submitting organization. Lifecycle hooks are not eligible for the public Plugins Directory. The marketplace package keeps its optional Codex prompt hook; generate a hook-free directory ZIP with:
+
+```powershell
+node plugins/codex-antigravity-router/server/package-directory.mjs C:\path\to\codex-antigravity-router-directory.zip
+```
+
+The generated ZIP contains the plugin package without `hooks/` and removes its hook declaration. Submission still requires the organization allowlist and OpenAI review. See [desktop-only submission requirements](https://developers.openai.com/plugins/deploy/desktop-only).
 
 Run the automated tests with `node --test` from `plugins/codex-antigravity-router`. The HTTP tests require loopback access. For reports, use the feedback form and redact tokens and private logs.
