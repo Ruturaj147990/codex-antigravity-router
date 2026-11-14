@@ -1,10 +1,10 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-antigravity-router",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Delegate coherent engineering work to Antigravity through isolated managed Git worktrees with independent verification and guarded integration.",
   "author": {
-    "name": "GameForge"
+    "name": "Ruturaj Limbkar"
   },
   "extensions": {
     "com.openai": {
@@ -16,7 +16,7 @@
         "websiteURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site",
         "supportURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site/feedback.html",
         "privacyPolicyURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site/privacy.html",
-        "developerName": "GameForge"
+        "developerName": "Ruturaj Limbkar"
       }
     }
   },

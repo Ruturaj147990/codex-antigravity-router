@@ -28,6 +28,6 @@ Ask Codex to open the router dashboard to get a temporary loopback URL. Choose t
 
 ## Release
 
-Version 1.0.0 includes the local browser dashboard, preferred-model selection, configurable worker ceiling, worktree scheduling, verification, and cancellation and recovery controls. Actual time and Codex usage savings have not been benchmarked.
+The router includes the local browser dashboard, model selection, a configurable worker limit, worktree scheduling, verification, cancellation, and recovery. Actual time and Codex usage savings have not been benchmarked.
 
 Run the automated tests with `node --test` from `plugins/codex-antigravity-router`. The HTTP tests require loopback access. For reports, use the feedback form and redact tokens and private logs.
