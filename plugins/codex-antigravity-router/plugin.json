@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-antigravity-router",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Delegate coherent engineering work to Antigravity through isolated managed Git worktrees with independent verification and guarded integration.",
   "author": {
     "name": "Ruturaj Limbkar"
