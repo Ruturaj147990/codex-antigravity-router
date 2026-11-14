@@ -1,0 +1,12 @@
+{
+  "name": "antigravity-task-router",
+  "interface": {"displayName": "Antigravity Task Router"},
+  "plugins": [
+    {
+      "name": "codex-antigravity-router",
+      "source": {"source": "local", "path": "./plugins/codex-antigravity-router"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Developer Tools"
+    }
+  ]
+}

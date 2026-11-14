@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "antigravity_router": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/server/index.mjs"
+      ],
+      "cwd": "${PLUGIN_ROOT}",
+      "env": {
+        "CODEX_ANTIGRAVITY_MODEL": "gemini-3.8-flash-low",
+        "CODEX_ANTIGRAVITY_MAX_WORKERS": "4"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-antigravity-router",
+  "version": "1.0.0",
+  "description": "Delegate coherent engineering work to Antigravity through isolated managed Git worktrees with independent verification and guarded integration.",
+  "author": {
+    "name": "GameForge"
+  },
+  "extensions": {
+    "com.openai": {
+      "hooks": "./hooks/hooks.json",
+      "interface": {
+        "displayName": "Antigravity Task Router",
+        "shortDescription": "Route tasks to Antigravity",
+        "longDescription": "Codex retains architecture and risk decisions while Antigravity investigates, implements, tests, and repairs scoped tasks in isolated worktrees. Users configure their preferred model and worker ceiling; Codex chooses how many independent tasks to run up to that ceiling.",
+        "websiteURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site",
+        "supportURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site/feedback.html",
+        "privacyPolicyURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site/privacy.html",
+        "developerName": "GameForge"
+      }
+    }
+  },
+  "license": "MIT",
+  "homepage": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site",
+  "repository": "https://github.com/Ruturaj147990/codex-antigravity-router"
+}
