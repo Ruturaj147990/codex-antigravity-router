@@ -28,8 +28,9 @@ export function resolveDelegationOptions(args, defaults = delegationDefaults()) 
     throw new Error(`maxParallel must be an integer from 1 to the configured maximum of ${defaults.maxWorkers}.`);
   }
   const maxParallel = args.executionMode === 'sequential' ? 1 : args.maxParallel ?? Math.min(defaults.maxWorkers, args.tasks?.length || 1);
-  const model = args.model === undefined ? defaults.model : validatePreferredModel(args.model, 'model');
-  return { ...args, model, runMode: args.runMode ?? defaults.runMode, maxParallel };
+  // The dashboard preference is authoritative. Task payloads cannot silently
+  // substitute a different provider/model; users change it in the dashboard.
+  return { ...args, model: defaults.model, runMode: args.runMode ?? defaults.runMode, maxParallel };
 }
 const task = { type: 'object', properties: {
   id: { type: 'string', description: 'Unique batch-local identifier: letters, digits, underscore or hyphen.' },

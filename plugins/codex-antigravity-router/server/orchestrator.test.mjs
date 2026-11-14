@@ -31,6 +31,7 @@ test('quota exhaustion preserves state, disables future delegation, and skips qu
   const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'router-quota-state-'));
   const oldSettings = process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE, oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT;
   process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = path.join(settingsRoot, 'settings.json');
+  fs.writeFileSync(process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE, JSON.stringify({ enabled: true, maxWorkers: 4, model: 'gemini-3.8-flash-low' }));
   process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateRoot;
   t.after(() => { if (oldSettings === undefined) delete process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE; else process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = oldSettings; if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState; fs.rmSync(settingsRoot, { recursive: true, force: true }); fs.rmSync(stateRoot, { recursive: true, force: true }); });
   const tasks = ['quota', 'queued'].map((id) => ({ id, title: `Task ${id}`, risk: 'LOW_RISK', instructions: 'Test quota stop.', allowedPaths: [`${id}.txt`], acceptanceCriteria: ['Task outcome is preserved'] }));
@@ -56,9 +57,8 @@ test('installed defaults honor a configurable model and worker ceiling', (t) => 
   assert.equal(options.maxParallel, 6);
   assert.equal(resolveDelegationOptions({ tasks: [1, 2], maxParallel: 1 }, defaults).maxParallel, 1);
   assert.equal(resolveDelegationOptions({ tasks: [1, 2], executionMode: 'sequential' }, defaults).maxParallel, 1);
-  assert.equal(resolveDelegationOptions({ tasks: [1, 2], model: ' custom-model ' }, defaults).model, 'custom-model');
+  assert.equal(resolveDelegationOptions({ tasks: [1, 2], model: 'gpt-oss-120b-medium' }, { ...defaults, model: 'gemini-3.8-flash-high' }).model, 'gemini-3.8-flash-high');
   assert.throws(() => resolveDelegationOptions({ tasks: Array.from({ length: 7 }), maxParallel: 7 }, defaults), /configured maximum of 6/);
-  assert.throws(() => resolveDelegationOptions({ tasks: [1], model: '  ' }, defaults), /model must be a non-empty/);
   assert.throws(() => resolveDelegationOptions({ tasks: [1], executionMode: 'parallel-ish' }, defaults), /executionMode must be/);
   assert.throws(() => resolveDelegationOptions({ tasks: [1], runMode: 'untrusted' }, defaults), /runMode must be/);
 });
