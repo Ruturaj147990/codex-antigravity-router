@@ -2,7 +2,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { availableModels, cancelTask, dashboardAgents, delegate, disposeTask, integrateTask, recover, requestStopAllWorkers, status } from './orchestrator.mjs';
+import { availableModels, cancelTask, dashboardAgents, delegate, disposeTask, integrateTask, recover, requestStopAllWorkers, status, waitForBatchChange } from './orchestrator.mjs';
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
 import { openBrowserDashboard } from './dashboard-web.mjs';
 
@@ -49,13 +49,14 @@ const tools = [
   { name: 'antigravity_dashboard_data', description: 'Read router settings and concise current worker state for the dashboard.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'antigravity_update_settings', description: 'Save delegation enabled state, model preference, and worker ceiling from the router dashboard.', inputSchema: { type: 'object', properties: { enabled: { type: 'boolean' }, maxWorkers: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, model: { type: 'string' } }, required: ['enabled', 'maxWorkers', 'model'], additionalProperties: false } },
   { name: 'antigravity_status', description: 'Check the local CLI, model, and Git workspace.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, model: { type: 'string' } }, required: ['workspaceRoot'], additionalProperties: false } },
-  { name: 'delegate_antigravity_tasks', description: 'Delegate to up to the user-configured Antigravity worker limit (1–32). Codex chooses a lower maxParallel for dependent or overlapping work. Antigravity selects checks but must not use terminal/code execution; the controller runs selected checks. Trusted-local commands use normal Windows user permissions when configured.', inputSchema: { type: 'object', properties: {
-    workspaceRoot: { type: 'string' }, model: { type: 'string' }, runMode: { type: 'string', enum: ['fail-closed', 'trusted-local'] }, executionMode: { type: 'string', enum: ['sequential', 'parallel'] }, maxParallel: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, timeoutSeconds: { type: 'integer', minimum: 60, maximum: 3600 },
+  { name: 'delegate_antigravity_tasks', description: 'Submit up to the user-configured Antigravity worker limit (1–32). Codex chooses a lower maxParallel for dependent or overlapping work. The controller runs every supplied verification check in order. Trusted-local commands use normal Windows user permissions when configured.', inputSchema: { type: 'object', properties: {
+    workspaceRoot: { type: 'string' }, model: { type: 'string' }, runMode: { type: 'string', enum: ['fail-closed', 'trusted-local'] }, executionMode: { type: 'string', enum: ['sequential', 'parallel'] }, maxParallel: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, timeoutSeconds: { type: 'integer', minimum: 60, maximum: 3600 }, waitSeconds: { type: 'integer', minimum: 0, maximum: 30, description: 'Maximum time to wait for this response; the durable batch ID is returned even if work continues.' },
     tasks: { type: 'array', minItems: 1, maxItems: 32, items: task }
   }, required: ['workspaceRoot', 'tasks'], additionalProperties: false } },
   { name: 'antigravity_recover', description: 'Inspect a preserved batch; optionally mark interrupted work for review and resume queued tasks without rerunning uncertain work.', inputSchema: { type: 'object', properties: {
     workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, resumeQueued: { type: 'boolean' }
   }, required: ['workspaceRoot', 'batchId'], additionalProperties: false } },
+  { name: 'antigravity_wait', description: 'Wait up to 30 seconds for a durable batch state change after a cursor, then return its full batch ID, updated cursor, and task states.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, cursor: { type: 'integer', minimum: 0 }, waitSeconds: { type: 'integer', minimum: 0, maximum: 30 } }, required: ['workspaceRoot', 'batchId', 'cursor'], additionalProperties: false } },
   { name: 'antigravity_integrate', description: 'Integrate one verified task held for HIGH_RISK or missing behavioral checks after Codex decides whether direct inspection is needed. Conflicts preserve the worker.', inputSchema: { type: 'object', properties: {
     workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, taskId: { type: 'string' }
   }, required: ['workspaceRoot', 'batchId', 'taskId'], additionalProperties: false } },
@@ -64,7 +65,7 @@ const tools = [
 ];
 const result = (value, isError = false) => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, isError });
 async function call(name, args) {
-  if (name === 'antigravity_dashboard') return result({ opened: true, ...(await openBrowserDashboard()), message: 'Open this temporary link in a browser on this computer.' });
+  if (name === 'antigravity_dashboard') return result({ serverStarted: true, browserOpened: false, ...(await openBrowserDashboard()), message: 'The local dashboard server is listening. Open the temporary link in a browser on this computer.' });
   if (name === 'antigravity_dashboard_data') return result({ settings: readUserSettings(), models: await availableModels(), agents: dashboardAgents() });
   if (name === 'antigravity_update_settings') {
     const model = validatePreferredModel(args.model, 'model');
@@ -86,6 +87,7 @@ async function call(name, args) {
     if (!/^[0-9a-f-]{36}$/i.test(args.batchId)) throw new Error('Invalid batch ID.');
     return result(await recover(args.workspaceRoot, args.batchId, args.resumeQueued === true));
   }
+  if (name === 'antigravity_wait') return result(await waitForBatchChange(args.workspaceRoot, args.batchId, args.cursor, args.waitSeconds ?? 20));
   if (name === 'antigravity_integrate') return result(await integrateTask(args.workspaceRoot, args.batchId, args.taskId));
   if (name === 'antigravity_cancel') return result(cancelTask(args.workspaceRoot, args.batchId, args.taskId));
   if (name === 'antigravity_dispose') return result(await disposeTask(args.workspaceRoot, args.batchId, args.taskId));

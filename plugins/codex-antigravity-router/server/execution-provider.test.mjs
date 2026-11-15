@@ -26,3 +26,22 @@ test('trusted-local executes an authorized command in its selected workspace', a
   assert.equal(result.exitCode, 0);
   assert.equal(result.output, process.cwd());
 });
+
+test('trusted-local preflights executables without substituting a missing runtime', async () => {
+  const provider = new TrustedLocalExecutionProvider();
+  const good = await provider.preflight({ workspace: process.cwd(), command: [process.execPath, '--version'] });
+  assert.equal(good.available, true);
+  const missing = await provider.preflight({ workspace: process.cwd(), command: ['codex-router-nonexistent-runtime-98765', 'script.py'] });
+  assert.equal(missing.available, false);
+  assert.match(missing.reason, /not found on PATH/);
+});
+
+test('trusted-local keeps stdout and stderr separate when a check fails', async () => {
+  const provider = new TrustedLocalExecutionProvider();
+  const result = await provider.run({ workspace: process.cwd(), command: [process.execPath, '-e', 'console.log("assertion digest 1234"); console.error("diagnostic stderr"); process.exitCode=3'], timeoutSeconds: 10 });
+  assert.equal(result.exitCode, 3);
+  assert.match(result.stdoutTail, /digest 1234/);
+  assert.match(result.stderrTail, /diagnostic stderr/);
+  assert.equal(result.timedOut, false);
+  assert.ok(result.durationMs >= 0);
+});

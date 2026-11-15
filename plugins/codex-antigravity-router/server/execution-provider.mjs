@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 const exec = promisify(execFile);
+const tail = (value, limit = 4000) => String(value || '').slice(-limit);
 
 export class ExecutionUnavailableError extends Error {
   constructor(message) { super(message); this.name = 'ExecutionUnavailableError'; }
@@ -11,14 +12,35 @@ export class ExecutionUnavailableError extends Error {
 
 export class TrustedLocalExecutionProvider {
   async capabilities() { return { mode: 'trusted-local', isolated: false, workspaceBound: true, capturesExitStatus: true }; }
+  async preflight({ workspace, command }) {
+    const cwd = fs.realpathSync.native(workspace), executable = command[0];
+    const isPath = path.isAbsolute(executable) || executable.includes('/') || executable.includes('\\');
+    if (isPath) {
+      const candidate = path.isAbsolute(executable) ? executable : path.resolve(cwd, executable);
+      if (!fs.existsSync(candidate)) return { workspace, available: false, reason: `Executable not found: ${path.relative(cwd, candidate) || path.basename(candidate)}` };
+    } else {
+      const resolver = process.platform === 'win32' ? 'where.exe' : 'which';
+      try { await exec(resolver, [executable], { cwd, windowsHide: true, timeout: 5000, maxBuffer: 20000 }); }
+      catch { return { workspace, available: false, reason: `Executable not found on PATH: ${executable}` }; }
+    }
+    // The Windows Python launcher can exist while the explicitly requested version does not.
+    if (process.platform === 'win32' && /^(?:py|py\.exe)$/i.test(path.basename(executable)) && /^-\d+(?:\.\d+)?$/.test(command[1] || '')) {
+      try { await exec(executable, [command[1], '--version'], { cwd, windowsHide: true, timeout: 10000, maxBuffer: 20000 }); }
+      catch { return { workspace, available: false, reason: `Requested Python runtime ${command[1]} is unavailable; no interpreter was substituted.` }; }
+    }
+    return { workspace, available: true };
+  }
   async run({ workspace, command, timeoutSeconds }) {
     if (!path.isAbsolute(workspace) || !fs.existsSync(workspace) || !Array.isArray(command) || !command.length || command.some((part) => typeof part !== 'string')) throw new Error('Invalid trusted-local command or workspace.');
     const cwd = fs.realpathSync.native(workspace);
+    const startedAt = Date.now();
     try {
       const { stdout, stderr } = await exec(command[0], command.slice(1), { cwd, windowsHide: true, shell: false, timeout: timeoutSeconds * 1000, maxBuffer: 2_000_000 });
-      return { workspace, exitCode: 0, output: (stdout + stderr).slice(-2000) };
+      const stdoutTail = tail(stdout), stderrTail = tail(stderr);
+      return { workspace, exitCode: 0, timedOut: false, durationMs: Date.now() - startedAt, stdoutTail, stderrTail, output: tail(`${stdoutTail}${stderrTail}`, 2000) };
     } catch (error) {
-      return { workspace, exitCode: Number.isInteger(error.code) ? error.code : 1, output: String(error.stderr || error.message).slice(-2000) };
+      const stdoutTail = tail(error.stdout), stderrTail = tail(error.stderr), timedOut = error.code === 'ETIMEDOUT' || error.killed === true;
+      return { workspace, exitCode: Number.isInteger(error.code) ? error.code : 1, timedOut, durationMs: Date.now() - startedAt, stdoutTail, stderrTail, output: tail(`${stdoutTail}${stderrTail || error.message || ''}`, 2000) };
     }
   }
 }

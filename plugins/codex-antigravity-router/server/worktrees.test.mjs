@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { acquire, changed, createWorker, integrate, persist, snapshot, stateRoot } from './worktrees.mjs';
+import { acquire, changed, createWorker, hash, integrate, persist, snapshot, stateRoot } from './worktrees.mjs';
 import { recover } from './orchestrator.mjs';
 
 function fixture() {
@@ -53,4 +53,12 @@ test('the controller lock rejects concurrent ownership', () => {
   release();
   const releaseAgain = acquire(root);
   releaseAgain();
+});
+
+test('snapshot hashes a sparse nonignored file larger than 2 GiB with bounded memory', () => {
+  const root = fixture(), large = path.join(root, 'large.bin'), fd = fs.openSync(large, 'w');
+  try { fs.ftruncateSync(fd, 2 * 1024 * 1024 * 1024 + 17); } finally { fs.closeSync(fd); }
+  const digest = hash(large), snap = snapshot(root);
+  assert.match(digest, /^[0-9a-f]{64}$/);
+  return snap.then((value) => assert.equal(value.files['large.bin'], digest));
 });

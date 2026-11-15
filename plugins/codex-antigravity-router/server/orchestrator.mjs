@@ -13,6 +13,30 @@ const CLI = process.env.CODEX_ANTIGRAVITY_CLI || path.join(os.homedir(), '.gemin
 const now = () => new Date().toISOString();
 const alive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 const normalize = (p) => key(path.resolve(p));
+let batchQueue = Promise.resolve();
+let queuedBatchCount = 0;
+const activeWorkerPids = new Set();
+const scheduledBatches = new Set();
+let integrationQueue = Promise.resolve();
+function enqueueBatch(batchId, run) {
+  queuedBatchCount++;
+  const position = queuedBatchCount;
+  scheduledBatches.add(batchId);
+  const completion = batchQueue.then(async () => { queuedBatchCount--; return run(); }).finally(() => scheduledBatches.delete(batchId));
+  batchQueue = completion.catch(() => {});
+  return { completion, position };
+}
+async function integrateWithControllerLock(root, worker, snap, files) {
+  let unlock;
+  const previous = integrationQueue;
+  integrationQueue = new Promise((resolve) => { unlock = resolve; });
+  await previous;
+  try {
+    const release = acquire(globalRoot());
+    try { return await integrate(root, worker, snap, files); }
+    finally { release(); }
+  } finally { unlock(); }
+}
 function liveUnownedWorkers() {
   const base = globalRoot();
   if (!fs.existsSync(base)) return [];
@@ -22,7 +46,7 @@ function liveUnownedWorkers() {
       const file = path.join(base, repo.name, batch.name, 'state.json');
       if (!fs.existsSync(file)) continue;
       const state = load(file);
-      for (const t of state.tasks || []) if (alive(t.pid)) found.push({ batchId: state.batchId, taskId: t.id, pid: t.pid });
+      for (const t of state.tasks || []) if (alive(t.pid) && !activeWorkerPids.has(t.pid)) found.push({ batchId: state.batchId, taskId: t.id, pid: t.pid });
     }
   return found;
 }
@@ -94,13 +118,14 @@ export function buildAgentPrompt(worker, t, retry = '') {
     t.instructions,
     `Allowed edits: ${t.allowedPaths.join(', ')}.`,
     `Acceptance: ${t.acceptanceCriteria.join('; ')}.`,
-    t.verificationCommands.length ? `Controller-authorized checks: ${t.verificationCommands.map((c, i) => `${i}: ${c.join(' ')}`).join('; ')}. Choose which listed checks are appropriate, but do not call terminal, command, notebook, or code-execution tools, including to run these commands. The controller executes the selected checks in the assigned worktree using the configured execution mode and returns actual output and failures for you to diagnose. If another check is needed, request it in your final report.` : 'No controller check is authorized. Do not call terminal, command, notebook, or code-execution tools; report what verification is needed.',
+    t.verificationCommands.length ? `Mandatory controller checks (all run in listed order): ${t.verificationCommands.map((c, i) => `${i}: ${c[0]} (${c.length - 1} arguments)`).join('; ')}. Do not call terminal, command, notebook, or code-execution tools. The controller runs every supplied check in the assigned worktree and returns bounded stdout/stderr, exit status, timeout and duration for each failure. Diagnose failures and repair the implementation.` : 'No controller check is authorized. Do not call terminal, command, notebook, or code-execution tools; report what verification is needed.',
     'Investigate root cause, implement the complete fix, and check it. Repair ordinary failures autonomously. No commit, push, destructive reset, external write, or further delegation. Preserve work. If consequential risk or out-of-scope edits are needed, stop and begin the final reply with ESCALATE_RISK: followed by the reason. Report concise changes, checks, uncertainty, and blockers.',
     retry ? `Independent verification failed: ${retry}. Diagnose and repair within the same worktree, then report the result.` : ''
   ].filter(Boolean).join('\n');
 }
 function runCli(worker, t, model, timeout, retry, onPid, cancelFile) {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const settings = JSON.stringify({ permissions: { allow: [`read_file(${worker})`, `write_file(${worker})`] } });
     const brief = buildAgentPrompt(worker, t, retry);
     const args = ['--sandbox', '--settings', settings, '--output-format', 'stream-json', '--mode', 'accept-edits', '--model', model, '--print-timeout', `${timeout}s`, '--print', brief];
@@ -113,7 +138,7 @@ function runCli(worker, t, model, timeout, retry, onPid, cancelFile) {
     child.stdout.on('data', (c) => { buffer += c; let n; while ((n = buffer.indexOf('\n')) >= 0) { line(buffer.slice(0, n)); buffer = buffer.slice(n + 1); } if (buffer.length > 4000000) buffer = ''; });
     child.stderr.on('data', (c) => { stderr = (stderr + c).slice(-3000); });
     child.on('error', (e) => { stderr = e.message; });
-    child.on('close', (code) => { clearTimeout(timer); clearInterval(cancellation); line(buffer); resolve({ code, timedOut, cancelled, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length }); });
+    child.on('close', (code) => { clearTimeout(timer); clearInterval(cancellation); line(buffer); resolve({ code, timedOut, cancelled, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length, durationMs: Date.now() - startedAt }); });
   });
 }
 export function quotaExhaustionReason(run) {
@@ -180,19 +205,19 @@ async function verify(worker, t, timeout, provider) {
     try {
       const result = await provider.run({ taskId: t.id, workspace: worker, command, timeoutSeconds: Math.min(timeout, 300) });
       if (result?.workspace !== worker || !Number.isInteger(result?.exitCode)) throw new Error('Restricted runner returned an invalid workspace or exit status.');
-      checks.push({ command, passed: result.exitCode === 0, output: String(result.output || '').slice(-1000) });
-    } catch (e) { checks.push({ command, passed: false, output: e.message.slice(-1000) }); }
+      checks.push({ command, label: `${command[0]} (${command.length - 1} args)`, passed: result.exitCode === 0, exitCode: result.exitCode, timedOut: result.timedOut === true, durationMs: Number.isFinite(result.durationMs) ? result.durationMs : null, stdoutTail: String(result.stdoutTail ?? result.output ?? '').slice(-2000), stderrTail: String(result.stderrTail || '').slice(-2000) });
+    } catch (e) { checks.push({ command, label: `${command[0]} (${command.length - 1} args)`, passed: false, exitCode: null, timedOut: false, durationMs: null, stdoutTail: '', stderrTail: String(e.message || e).slice(-2000) }); }
   }
   return checks;
 }
-async function execute(root, folder, state, t, model, timeout, save, provider, workerRunner) {
+async function execute(root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot) {
   t.status = 'preparing'; save();
   const cancelFile = path.join(folder, `${t.id}.cancel`);
   const worker = await managedCheckout(root, state.batchId, state.tasks.indexOf(t));
   t.worker = worker; save();
-  const snap = await snapshot(root);
-  const snapshotFile = path.join(folder, `${t.id}.snapshot.json`);
-  persist(snapshotFile, snap);
+  const prepared = await getSnapshot(t);
+  const { snap, snapshotFile } = prepared;
+  t.snapshotDurationMs = prepared.createdForTask === t.id ? prepared.durationMs : 0;
   t.snapshotFile = snapshotFile; save();
   await createWorker(root, folder, t.id, snap, worker);
   if (fs.existsSync(cancelFile)) { t.status = 'cancelled'; save(); return; }
@@ -201,13 +226,21 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
   for (let attempt = 0; attempt < 2; attempt++) {
     t.attempts = attempt + 1; save();
     const retry = attempt ? t.verificationFailure : '';
-    run = await (workerRunner ? workerRunner({ worker, task: t, model, timeout, retry, onPid: (pid) => { t.pid = pid; save(); }, cancelFile }) : runCli(worker, t, model, timeout, retry, (pid) => { t.pid = pid; save(); }, cancelFile));
+    const attemptStartedAt = Date.now();
+    const trackPid = (pid) => { if (pid) activeWorkerPids.add(pid); t.pid = pid; save(); };
+    try { run = await (workerRunner ? workerRunner({ worker, task: t, model, timeout, retry, onPid: trackPid, cancelFile }) : runCli(worker, t, model, timeout, retry, trackPid, cancelFile)); }
+    finally { if (t.pid) activeWorkerPids.delete(t.pid); }
     t.briefCharacters = (t.briefCharacters || 0) + run.briefCharacters;
+    t.workerDurationMs = (t.workerDurationMs || 0) + (Number.isFinite(run.durationMs) ? run.durationMs : Date.now() - attemptStartedAt);
+    t.toolEvents = (t.toolEvents || 0) + (Array.isArray(run.tools) ? run.tools.length : 0);
     t.antigravityTokens = (t.antigravityTokens || 0) + (run.result?.usage?.total_tokens || 0);
     t.pid = null; t.conversationId = run.result?.conversation_id || t.conversationId; save();
     if (run.cancelled || fs.existsSync(cancelFile)) { t.status = 'cancelled'; break; }
-    reply = String(run.result?.response || '').slice(0, 1800);
+    const rawReply = String(run.result?.response || '');
+    t.responseCharacters = (t.responseCharacters || 0) + rawReply.length;
+    reply = rawReply.slice(0, 1800);
     edits = await changed(worker, snap);
+    if (run.timedOut && edits.length === 0) t.zeroEditTimeouts = (t.zeroEditTimeouts || 0) + 1;
     const quota = quotaExhaustionReason(run);
     if (quota) {
       t.changedFiles = edits;
@@ -221,7 +254,13 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     const commandTools = run.tools.filter((x) => /run_command|send_command_input|notebook_execution/i.test(x.name || ''));
     if (run.timedOut || run.code !== 0 || run.result?.status !== 'SUCCESS' || !cwdOk || run.denied.length || scope.length || commandTools.length) {
       t.status = 'needs_review';
-      t.error = run.timedOut ? 'CLI timeout' : !cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? 'Command side effects need review' : run.denied.length ? `CLI permission denials: ${run.denied.map((d) => d.action).join(', ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`;
+      const deniedDetails = run.denied.map((d) => {
+        const item = typeof d === 'string' ? { action: d } : d || {};
+        const scopePath = item.path || item.scope || item.target;
+        const relativeScope = typeof scopePath === 'string' && path.isAbsolute(scopePath) ? (normalize(scopePath).startsWith(`${normalize(worker)}${path.sep}`) ? path.relative(worker, scopePath).replaceAll('\\', '/') : '[outside assigned worktree]') : String(scopePath || 'unspecified');
+        return `${String(item.action || item.tool || 'unknown tool').slice(0, 80)}; rule=${String(item.rule || item.reason || 'not reported').slice(0, 120)}; scope=${relativeScope}; executed=${item.executed === true ? 'yes' : 'no/unknown'}`;
+      });
+      t.error = run.timedOut ? 'CLI timeout' : !cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? `Command side effects need review: ${commandTools.map((x) => `${x.name || 'command'} (${x.state || 'state unknown'})`).join(', ')}` : run.denied.length ? `CLI permission denials: ${deniedDetails.join(' | ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`;
       break;
     }
     if (/^\s*ESCALATE_RISK:/i.test(reply)) { t.status = 'needs_review'; t.error = 'Worker escalated risk or scope'; break; }
@@ -233,26 +272,45 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
       if (edits.some((p) => hash(safeFile(worker, p)) !== beforeChecks[p])) { t.status = 'needs_review'; t.error = 'Verification command modified worker output.'; break; }
       t.status = 'verified'; break;
     }
-    t.verificationFailure = failed.map((c) => `${c.command.join(' ')}: ${c.output}`).join('; ').slice(0, 1200);
+    t.verificationFailure = failed.map((c) => JSON.stringify({ check: c.label, exitCode: c.exitCode, timedOut: c.timedOut, durationMs: c.durationMs, stdoutTail: c.stdoutTail.slice(-1200), stderrTail: c.stderrTail.slice(-1200) })).join('\n');
     t.status = attempt ? 'needs_review' : 'retrying'; save();
     if (attempt) t.error = 'Independent verification failed after autonomous repair';
   }
   const finalEdits = await changed(worker, snap);
   if (t.status === 'verified' && (finalEdits.length !== edits.length || finalEdits.some((p, i) => p !== edits[i]))) { t.status = 'needs_review'; t.error = 'Verification changed the worker file set; inspect before integration.'; }
-  t.changedFiles = finalEdits; t.outputHashes = Object.fromEntries(finalEdits.map((p) => [p, hash(safeFile(worker, p))])); t.checks = checks.map(({ command, passed }) => ({ command, passed })); t.reply = reply; t.usage = run?.result?.usage || null; t.finishedAt = now(); save();
+  t.changedFiles = finalEdits; t.outputHashes = Object.fromEntries(finalEdits.map((p) => [p, hash(safeFile(worker, p))])); t.checks = checks; t.reply = reply; t.usage = run?.result?.usage || null; t.finishedAt = now(); save();
   if (t.status !== 'verified') return;
   if (fs.existsSync(cancelFile)) { t.status = 'cancelled'; save(); return; }
   if (!t.verificationCommands.length) { t.status = 'awaiting_integration'; t.error = 'No independent check was supplied; Codex must review before integration.'; save(); return; }
   if (t.risk === 'HIGH_RISK') { t.status = 'awaiting_integration'; save(); return; }
   t.status = 'integrating'; save();
-  const result = await integrate(root, worker, snap, edits);
+  const result = await integrateWithControllerLock(root, worker, snap, edits);
   if (!result.integrated) { t.status = 'conflict'; t.conflicts = result.conflicts; }
-  else t.status = 'completed';
+  else { t.status = 'completed'; state.invalidateSnapshot?.(); }
   save();
 }
-function report(state) { return { batchId: state.batchId, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, attempts: t.attempts, changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
+function report(state) { return { batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
 async function schedule(state, folder, model, timeout, provider, workerRunner) {
-  const save = () => persist(state.stateFile, state);
+  const save = () => { state.revision = (state.revision || 0) + 1; state.updatedAt = now(); persist(state.stateFile, state); };
+  let snapshotGeneration = 0, snapshotPromise = null, snapshotDurationMs = 0;
+  const getSnapshot = async (task) => {
+    if (!snapshotPromise) {
+      const generation = snapshotGeneration;
+      const startedAt = Date.now();
+      snapshotPromise = snapshot(state.root).then((snap) => {
+        const durationMs = Date.now() - startedAt;
+        snapshotDurationMs += durationMs;
+        state.snapshotPreparations = (state.snapshotPreparations || 0) + 1;
+        const snapshotFile = path.join(folder, `${state.batchId}.snapshot.${generation}.json`);
+        persist(snapshotFile, snap);
+        save();
+        return { snap, snapshotFile, durationMs, createdForTask: task.id };
+      }).catch((error) => { snapshotPromise = null; throw error; });
+    }
+    return snapshotPromise;
+  };
+  state.invalidateSnapshot = () => { snapshotGeneration++; snapshotPromise = null; };
+  state.batchStatus = 'running'; save();
   const running = new Set();
   const jobs = new Map();
   const configuredWorkers = Number.isSafeInteger(state.maxWorkers) ? state.maxWorkers : readUserSettings().maxWorkers;
@@ -273,7 +331,7 @@ async function schedule(state, folder, model, timeout, provider, workerRunner) {
       if (state.tasks.slice(0, index).some((x) => ['awaiting_integration', 'conflict', 'needs_review'].includes(x.status) && overlaps(x, t))) continue;
       if ([...running].some((x) => overlaps(x, t))) continue;
       t.status = 'starting'; t.dispatchedAt = now(); save(); started = true;
-      const job = execute(state.root, folder, state, t, model, timeout, save, provider, workerRunner).catch((e) => { t.status = 'needs_review'; t.error = e.message; t.finishedAt = now(); save(); }).finally(() => { running.delete(t); });
+      const job = execute(state.root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot).catch((e) => { t.status = 'needs_review'; t.error = e.message; t.finishedAt = now(); save(); }).finally(() => { running.delete(t); });
       jobs.set(t.id, job); running.add(t);
     }
     if (!running.size) break;
@@ -281,7 +339,9 @@ async function schedule(state, folder, model, timeout, provider, workerRunner) {
     if (!started) continue;
   }
   for (const t of state.tasks) if (t.status === 'queued') { t.status = 'blocked'; t.error = 'A dependency or earlier overlapping task needs completion or review.'; }
-  state.finishedAt = now(); save();
+  state.snapshotDurationMs = snapshotDurationMs;
+  delete state.invalidateSnapshot;
+  state.finishedAt = now(); state.batchStatus = 'finished'; save();
   return report(state);
 }
 export async function delegate(root, rawTasks, options = {}) {
@@ -290,7 +350,9 @@ export async function delegate(root, rawTasks, options = {}) {
   const tasks = validate(rawTasks);
   const model = options.model === undefined ? settings.model : validatePreferredModel(options.model, 'model');
   const timeout = options.timeoutSeconds ?? 1200;
+  const waitSeconds = options.waitSeconds ?? 20;
   if (!Number.isSafeInteger(timeout) || timeout < 60 || timeout > 3600) throw new Error('timeoutSeconds must be an integer from 60 to 3600.');
+  if (!Number.isSafeInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 30) throw new Error('waitSeconds must be an integer from 0 to 30.');
   if (options.executionMode !== undefined && !['sequential', 'parallel'].includes(options.executionMode)) throw new Error('executionMode must be sequential or parallel.');
   if (options.runMode !== undefined && !['fail-closed', 'trusted-local'].includes(options.runMode)) throw new Error('runMode must be fail-closed or trusted-local.');
   if (options.maxParallel !== undefined && (!Number.isSafeInteger(options.maxParallel) || options.maxParallel < 1 || options.maxParallel > settings.maxWorkers)) {
@@ -301,25 +363,58 @@ export async function delegate(root, rawTasks, options = {}) {
   const runMode = options.runMode || 'fail-closed';
   const provider = options.executionProvider || await configuredExecutionProvider(runMode);
   if (tasks.some((t) => t.verificationCommands.length)) await requireAuthorizedProvider(provider, runMode);
+  if (tasks.some((t) => t.verificationCommands.length) && typeof provider.preflight === 'function') {
+    for (const t of tasks) for (const command of t.verificationCommands) {
+      const checked = await provider.preflight({ taskId: t.id, workspace: canonical(root), command });
+      if (checked?.workspace !== canonical(root) || checked?.available !== true) throw new Error(`Verification preflight failed for task ${t.id} (${command[0]}): ${checked?.reason || 'executable availability could not be confirmed'}. No worker was launched.`);
+    }
+  }
   if (!options.workerRunner) { const ready = await status(root, model); if (!ready.ready) throw new Error(ready.message); }
   const base = stateRoot(root), release = acquire(globalRoot());
+  let lockHeld = true;
   try {
     const orphans = liveUnownedWorkers();
     if (orphans.length) throw new Error(`A preserved Antigravity CLI process may still be active: ${JSON.stringify(orphans)}. Inspect or recover it before starting another batch.`);
     const batchId = crypto.randomUUID(), folder = path.join(base, batchId);
     fs.mkdirSync(folder, { recursive: true });
     await managedCheckout(root, batchId, 0);
-    const state = { version: 1, batchId, root: canonical(root), model, timeout, runMode, maxWorkers: settings.maxWorkers, maxParallel, createdAt: now(), tasks };
+    const state = { version: 1, batchId, root: canonical(root), model, timeout, runMode, maxWorkers: settings.maxWorkers, maxParallel, revision: 0, batchStatus: 'queued', createdAt: now(), tasks };
     state.stateFile = path.join(folder, 'state.json'); persist(state.stateFile, state);
-    return await schedule(state, folder, model, timeout, provider, options.workerRunner);
-  } finally { release(); }
+    release(); lockHeld = false;
+    const queued = enqueueBatch(batchId, () => schedule(state, folder, model, timeout, provider, options.workerRunner));
+    const completion = queued.completion.catch((error) => { state.controllerError = String(error.message || error).slice(0, 500); state.finishedAt = now(); state.batchStatus = 'failed'; persist(state.stateFile, state); return report(state); });
+    if (waitSeconds === 0) return { ...report(state), pending: true, queuePosition: queued.position };
+    let timer;
+    const early = Symbol('bounded wait expired');
+    const result = await Promise.race([completion, new Promise((resolve) => { timer = setTimeout(() => resolve(early), waitSeconds * 1000); })]);
+    clearTimeout(timer);
+    if (result === early) return { ...report(state), pending: true, queuePosition: queued.position };
+    return result;
+  } catch (error) { if (lockHeld) release(); throw error; }
+}
+
+export async function waitForBatchChange(root, batchId, cursor, waitSeconds = 20) {
+  if (typeof batchId !== 'string' || !/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch ID.');
+  if (!Number.isSafeInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 30) throw new Error('waitSeconds must be an integer from 0 to 30.');
+  const file = path.join(stateRoot(root), batchId, 'state.json');
+  const initial = load(file);
+  if (normalize(initial.root) !== normalize(canonical(root))) throw new Error('Batch belongs to a different workspace.');
+  const deadline = Date.now() + waitSeconds * 1000;
+  let state = initial;
+  while (state.revision === cursor && Date.now() < deadline && !state.finishedAt) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    state = load(file);
+  }
+  return { ...report(state), waitExpired: state.revision === cursor && !state.finishedAt };
 }
 export async function recover(root, batchId, resume = false, executionProvider = null) {
   const base = stateRoot(root), folder = path.join(base, batchId), file = path.join(folder, 'state.json');
   const state = load(file);
   if (normalize(state.root) !== normalize(canonical(root))) throw new Error('Batch belongs to a different workspace.');
   if (!resume) return report(state);
+  if (scheduledBatches.has(batchId)) return { ...report(state), warning: 'This batch is already queued or running in this router process; no duplicate worker dispatch was created.' };
   const release = acquire(globalRoot());
+  let lockHeld = true;
   try {
     const orphans = liveUnownedWorkers();
     if (orphans.length) return { ...report(state), warning: `Live worker processes require inspection before queue recovery: ${JSON.stringify(orphans)}` };
@@ -333,17 +428,22 @@ export async function recover(root, batchId, resume = false, executionProvider =
     await managedCheckout(root, batchId, 0);
     const provider = executionProvider || await configuredExecutionProvider(state.runMode || 'fail-closed');
     if (state.tasks.some((t) => t.status === 'queued' && t.verificationCommands?.length)) await requireAuthorizedProvider(provider, state.runMode || 'fail-closed');
-    return await schedule(state, folder, state.model, state.timeout, provider);
-  } finally { release(); }
+    state.batchStatus = 'queued'; persist(file, state);
+    release(); lockHeld = false;
+    const queued = enqueueBatch(batchId, () => schedule(state, folder, state.model, state.timeout, provider));
+    return await queued.completion;
+  } finally { if (lockHeld) release(); }
 }
 export async function integrateTask(root, batchId, taskId, executionProvider = null) {
   if (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch ID.');
   const base = stateRoot(root), release = acquire(globalRoot());
+  let lockHeld = true;
   try {
     const orphans = liveUnownedWorkers();
     if (orphans.length) throw new Error(`Live worker processes require inspection before integration: ${JSON.stringify(orphans)}`);
     const file = path.join(base, batchId, 'state.json'), state = load(file);
     if (normalize(state.root) !== normalize(canonical(root))) throw new Error('Batch belongs to a different workspace.');
+    if (state.batchStatus === 'running') throw new Error('This batch is still running. Wait for its current tasks to finish before integrating output.');
     const t = state.tasks.find((item) => item.id === taskId);
     if (!t || t.status !== 'awaiting_integration') throw new Error('Task is not awaiting integration.');
     const snap = load(t.snapshotFile), edits = await changed(t.worker, snap);
@@ -358,10 +458,13 @@ export async function integrateTask(root, batchId, taskId, executionProvider = n
       persist(file, state);
       const provider = executionProvider || await configuredExecutionProvider(state.runMode || 'fail-closed');
       if (state.tasks.some((item) => item.status === 'queued' && item.verificationCommands?.length)) await requireAuthorizedProvider(provider, state.runMode || 'fail-closed');
-      return await schedule(state, path.dirname(file), state.model, state.timeout, provider);
+      state.batchStatus = 'queued'; persist(file, state);
+      release(); lockHeld = false;
+      const queued = enqueueBatch(batchId, () => schedule(state, path.dirname(file), state.model, state.timeout, provider));
+      return await queued.completion;
     }
     return report(state);
-  } finally { release(); }
+  } finally { if (lockHeld) release(); }
 }
 export function cancelTask(root, batchId, taskId) {
   if (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch ID.');

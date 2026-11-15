@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { delegationDefaults, resolveDelegationOptions } from './index.mjs';
-import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, disposeTask, integrateTask, quotaExhaustionReason } from './orchestrator.mjs';
+import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
 
 test('quota failures are classified without treating ordinary failures as exhaustion', () => {
   assert.match(quotaExhaustionReason({ stderr: 'HTTP 429 RESOURCE_EXHAUSTED: quota exceeded' }), /quota exceeded/i);
@@ -63,14 +63,95 @@ test('installed defaults honor a configurable model and worker ceiling', (t) => 
   assert.throws(() => resolveDelegationOptions({ tasks: [1], runMode: 'untrusted' }, defaults), /runMode must be/);
 });
 
-test('Antigravity prompt routes selected checks to the controller and forbids agent command tools', () => {
+test('Antigravity prompt marks every supplied check mandatory and forbids agent command tools', () => {
   const brief = buildAgentPrompt('C:/worker', {
     title: 'Test task', risk: 'LOW_RISK', instructions: 'Change the implementation.',
     allowedPaths: ['src/a.js'], acceptanceCriteria: ['The behavior works.'],
     verificationCommands: [['node', '--test', 'test.mjs']]
   });
   assert.match(brief, /do not call terminal, command, notebook, or code-execution tools/i);
-  assert.match(brief, /controller executes the selected checks/i);
+  assert.match(brief, /mandatory controller checks \(all run in listed order\)/i);
+  assert.doesNotMatch(brief, /choose which listed checks/i);
+});
+
+test('verification failures retain stdout, stderr, exit status, timeout and duration for repair', async (t) => {
+  const root = fixture(); process.env.CODEX_ANTIGRAVITY_STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'router-diagnostics-'));
+  t.after(() => fs.rmSync(process.env.CODEX_ANTIGRAVITY_STATE_ROOT, { recursive: true, force: true }));
+  const diagnosticsProvider = { ...provider, run: async ({ workspace }) => ({ workspace, exitCode: 1, timedOut: false, durationMs: 31, stdoutTail: 'AssertionError: expected digest 1234', stderrTail: 'pytest collection warning' }) };
+  const task = { id: 'diagnostics', title: 'Preserve diagnostics', risk: 'LOW_RISK', instructions: 'Create a file.', allowedPaths: ['diagnostic.txt'], acceptanceCriteria: ['Check failure remains actionable'], verificationCommands: [['pytest', '-q', 'a long suite path']] };
+  const result = await delegate(root, [task], { workerRunner: async ({ worker }) => { fs.writeFileSync(path.join(worker, 'diagnostic.txt'), 'output'); return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; }, executionProvider: diagnosticsProvider });
+  const check = result.results[0].checks[0];
+  assert.equal(check.exitCode, 1); assert.equal(check.durationMs, 31);
+  assert.match(check.stdoutTail, /digest 1234/); assert.match(check.stderrTail, /collection warning/);
+});
+
+test('bounded delegation wait returns a durable batch handle and cursor before work finishes', async (t) => {
+  const root = fixture(), oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT, stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'router-bounded-wait-'));
+  process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateDir;
+  t.after(() => { if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState; fs.rmSync(stateDir, { recursive: true, force: true }); });
+  const task = { id: 'slow', title: 'Slow task', risk: 'LOW_RISK', instructions: 'Write a file.', allowedPaths: ['slow.txt'], acceptanceCriteria: ['File exists'] };
+  const submitted = await delegate(root, [task], { waitSeconds: 0, workerRunner: async ({ worker }) => { await new Promise((resolve) => setTimeout(resolve, 100)); fs.writeFileSync(path.join(worker, 'slow.txt'), 'done'); return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; } });
+  assert.equal(submitted.pending, true); assert.match(submitted.batchId, /^[0-9a-f-]{36}$/); assert.ok(Number.isInteger(submitted.cursor));
+  const changedState = await waitForBatchChange(root, submitted.batchId, submitted.cursor, 5);
+  assert.ok(changedState.cursor > submitted.cursor);
+  let finished = changedState;
+  for (let attempt = 0; attempt < 10 && finished.results[0].status !== 'awaiting_integration'; attempt++) finished = await waitForBatchChange(root, submitted.batchId, finished.cursor, 5);
+  assert.equal(finished.results[0].status, 'awaiting_integration');
+});
+
+test('independent submissions queue FIFO while an owned worker is active', async (t) => {
+  const root = fixture(), stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'router-batch-queue-'));
+  const oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT, oldSettings = process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE;
+  const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'router-batch-queue-settings-'));
+  process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateDir;
+  process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = path.join(settingsDir, 'settings.json');
+  fs.writeFileSync(process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE, JSON.stringify({ enabled: true, maxWorkers: 4, model: 'gemini-3.8-flash-low' }));
+  t.after(() => { if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState; if (oldSettings === undefined) delete process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE; else process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = oldSettings; fs.rmSync(stateDir, { recursive: true, force: true }); fs.rmSync(settingsDir, { recursive: true, force: true }); });
+  let signalStarted, releaseFirst;
+  const firstStarted = new Promise((resolve) => { signalStarted = resolve; });
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const started = [];
+  const workerRunner = async ({ worker, task, onPid }) => {
+    onPid(process.pid); started.push(task.id);
+    if (task.id === 'first') { signalStarted(); await firstGate; }
+    fs.writeFileSync(path.join(worker, `${task.id}.txt`), task.id);
+    return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 };
+  };
+  const task = (id) => ({ id, title: id, risk: 'HIGH_RISK', instructions: 'Write the assigned file.', allowedPaths: [`${id}.txt`], acceptanceCriteria: ['File exists'] });
+  const firstPromise = delegate(root, [task('first')], { workerRunner });
+  await firstStarted;
+  const second = await delegate(root, [task('second')], { workerRunner, waitSeconds: 0 });
+  assert.equal(second.pending, true);
+  assert.equal(second.queuePosition, 1);
+  assert.deepEqual(started, ['first']);
+  const duplicateRecovery = await recover(root, second.batchId, true);
+  assert.match(duplicateRecovery.warning, /already queued or running/i);
+  releaseFirst();
+  const first = await firstPromise;
+  assert.equal(first.results[0].status, 'awaiting_integration');
+  for (let i = 0; i < 50 && !started.includes('second'); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(started, ['first', 'second']);
+  let latest = await waitForBatchChange(root, second.batchId, second.cursor, 5);
+  for (let i = 0; i < 10 && latest.results[0].status !== 'awaiting_integration'; i++) latest = await waitForBatchChange(root, second.batchId, latest.cursor, 5);
+  assert.equal(latest.results[0].status, 'awaiting_integration');
+});
+
+test('parallel tasks in one batch reuse their immutable source snapshot', async (t) => {
+  const root = fixture(), stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'router-snapshot-reuse-'));
+  const oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT;
+  process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateDir;
+  t.after(() => { if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState; fs.rmSync(stateDir, { recursive: true, force: true }); });
+  const tasks = ['one', 'two'].map((id) => ({ id, title: id, risk: 'HIGH_RISK', instructions: 'Write the assigned file.', allowedPaths: [`${id}.txt`], acceptanceCriteria: ['File exists'] }));
+  const workerRunner = async ({ worker, task }) => {
+    fs.writeFileSync(path.join(worker, `${task.id}.txt`), task.id);
+    return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 };
+  };
+  const result = await delegate(root, tasks, { maxParallel: 2, workerRunner });
+  assert.equal(result.snapshotPreparations, 1);
+  assert.equal(result.results.filter((item) => item.snapshotDurationMs > 0).length, 1);
+  const state = JSON.parse(fs.readFileSync(result.stateFile, 'utf8'));
+  assert.equal(state.tasks[0].snapshotFile, state.tasks[1].snapshotFile);
+  assert.deepEqual(result.results.map((item) => item.status), ['awaiting_integration', 'awaiting_integration']);
 });
 
 function fixture() {
