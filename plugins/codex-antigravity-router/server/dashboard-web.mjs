@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { availableModels, dashboardAgents, requestStopAllWorkers } from './orchestrator.mjs';
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
+import { verificationReadiness } from './execution-provider.mjs';
 
 const htmlPath = fileURLToPath(new URL('./dashboard-browser.html', import.meta.url));
 const equalSecret = (left, right) => {
@@ -22,7 +23,7 @@ async function readJson(req) {
   catch { throw new Error('Settings request must contain valid JSON.'); }
 }
 
-export async function createDashboardServer({ host = '127.0.0.1', port = 0, token = crypto.randomBytes(32).toString('hex'), models = availableModels, agents = dashboardAgents, settings = readUserSettings, saveSettings = writeUserSettings, stopWorkers = requestStopAllWorkers } = {}) {
+export async function createDashboardServer({ host = '127.0.0.1', port = 0, token = crypto.randomBytes(32).toString('hex'), models = availableModels, agents = dashboardAgents, settings = readUserSettings, saveSettings = writeUserSettings, stopWorkers = requestStopAllWorkers, verification = verificationReadiness } = {}) {
   if (host !== '127.0.0.1') throw new Error('The browser dashboard must bind to 127.0.0.1 only.');
   const server = http.createServer(async (req, res) => {
     try {
@@ -35,7 +36,7 @@ export async function createDashboardServer({ host = '127.0.0.1', port = 0, toke
       if (!['/api/dashboard', '/api/settings'].includes(url.pathname)) return send(res, 404, { error: 'Not found.' });
       if (!equalSecret(req.headers.authorization, `Bearer ${token}`)) return send(res, 401, { error: 'Dashboard link expired or missing its local access token.' });
       if (req.method === 'GET' && url.pathname === '/api/dashboard') {
-        return send(res, 200, { settings: settings(), models: await models(), agents: agents(), updatedAt: new Date().toISOString() });
+        return send(res, 200, { settings: settings(), models: await models(), agents: agents(), verification: await verification(), updatedAt: new Date().toISOString() });
       }
       if (req.method === 'POST' && url.pathname === '/api/settings') {
         if (!String(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) return send(res, 415, { error: 'Settings must be submitted as JSON.' });

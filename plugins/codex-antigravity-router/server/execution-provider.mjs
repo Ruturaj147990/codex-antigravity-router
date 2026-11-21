@@ -61,6 +61,32 @@ export async function configuredExecutionProvider(mode = 'fail-closed') {
   return await requireIsolatedProvider(await module.createExecutionProvider());
 }
 
+export async function verificationReadiness(env = process.env) {
+  const optInVariable = 'CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE';
+  if (env[optInVariable] === 'trusted-local') {
+    return { ready: true, mode: 'trusted-local', isolated: false, message: 'Ready: trusted-local checks run with the normal Windows user permissions; they are not sandboxed.' };
+  }
+  const modulePath = env.CODEX_ANTIGRAVITY_EXECUTION_PROVIDER;
+  if (!modulePath) {
+    return {
+      ready: false, mode: 'fail-closed', isolated: false, requiredOptIn: optInVariable,
+      reason: 'No verified restricted execution provider is configured.',
+      message: `Verification is unavailable. Configure a restricted provider, or set ${optInVariable}=trusted-local before launching Codex and restart Codex. Trusted-local checks use normal Windows user permissions and are not sandboxed.`
+    };
+  }
+  if (!path.isAbsolute(modulePath)) {
+    return { ready: false, mode: 'fail-closed', isolated: false, reason: 'Execution provider path must be absolute.', message: 'Verification is unavailable because the configured execution provider path is not absolute.' };
+  }
+  try {
+    const module = await import(pathToFileURL(modulePath).href);
+    if (typeof module.createExecutionProvider !== 'function') throw new ExecutionUnavailableError('Execution provider must export createExecutionProvider().');
+    await requireIsolatedProvider(await module.createExecutionProvider());
+    return { ready: true, mode: 'restricted', isolated: true, message: 'Ready: the configured restricted verification provider passed its capability checks.' };
+  } catch (error) {
+    return { ready: false, mode: 'fail-closed', isolated: false, reason: error.message, message: `Verification is unavailable: ${error.message}` };
+  }
+}
+
 export async function requireAuthorizedProvider(provider, mode) {
   const capabilities = await provider.capabilities();
   if (mode === 'trusted-local' && capabilities?.mode === 'trusted-local' && capabilities?.workspaceBound === true && capabilities?.capturesExitStatus === true) return provider;

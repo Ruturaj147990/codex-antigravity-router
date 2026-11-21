@@ -9,6 +9,7 @@ test('browser dashboard serves settings and agent data and saves validated prefe
     token: 'test-secret',
     models: async () => ['gemini-3.8-flash-low', 'gemini-3.8-flash-high'],
     agents: () => [{ name: 'Worker demo', task: 'Add demo output', phase: 'running', live: true, workspace: 'demo', model: current.model }],
+    verification: async () => ({ ready: false, mode: 'fail-closed', requiredOptIn: 'CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE', message: 'Verification unavailable; restart Codex after trusted-local opt-in.' }),
     settings: () => current,
     saveSettings: (patch) => { current = { ...current, ...patch }; return current; },
     stopWorkers: () => { stopCount++; return 2; }
@@ -22,6 +23,8 @@ test('browser dashboard serves settings and agent data and saves validated prefe
   const data = await (await fetch(`${base}api/dashboard`, { headers })).json();
   assert.deepEqual(data.models, ['gemini-3.8-flash-low', 'gemini-3.8-flash-high']);
   assert.equal(data.agents[0].name, 'Worker demo');
+  assert.equal(data.verification.ready, false);
+  assert.match(data.verification.message, /restart Codex/);
   const update = await fetch(`${base}api/settings`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ enabled: false, maxWorkers: 6, model: 'gemini-3.8-flash-high' }) });
   assert.equal(update.status, 200);
   assert.equal((await update.json()).stoppedWorkers, 2);
@@ -49,7 +52,9 @@ test('plugin dashboard entry point returns a temporary loopback browser link', a
   assert.match(link.url, new RegExp(`^http://127\\.0\\.0\\.1:${link.port}/#token=[a-f0-9]{64}$`));
   const response = await fetch(link.baseUrl || `http://127.0.0.1:${link.port}/`);
   assert.equal(response.status, 200);
-  assert.match(await response.text(), /Antigravity Router/);
+  const html = await response.text();
+  assert.match(html, /Antigravity Router/);
+  assert.match(html, /Verification readiness/);
   assert.equal(link.listening, true);
   assert.equal(link.verifiedReachable, true);
   assert.equal(link.browserOpened, false);

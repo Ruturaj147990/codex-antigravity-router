@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { acquire, canonical, changed, createWorker, disposeWorker, git, globalRoot, hash, integrate, key, load, managedCheckout, persist, safeFile, snapshot, stateRoot, withGitLogs } from './worktrees.mjs';
-import { configuredExecutionProvider, requireAuthorizedProvider } from './execution-provider.mjs';
+import { configuredExecutionProvider, requireAuthorizedProvider, verificationReadiness } from './execution-provider.mjs';
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
 
 const exec = promisify(execFile);
@@ -101,11 +101,13 @@ function claimSlot(state, task, save) {
 }
 
 export async function status(root, model) {
+  const verification = await verificationReadiness();
+  const verificationFields = { verificationReady: verification.ready, verificationMode: verification.mode, verification, restrictedVerification: verification.mode === 'restricted', restrictedVerificationReason: verification.mode === 'restricted' ? undefined : verification.reason };
   let settings;
   try { settings = readUserSettings(); }
-  catch (e) { return { ready: false, message: `Invalid Antigravity router settings: ${e.message}` }; }
+  catch (e) { return { ready: false, ...verificationFields, message: `Invalid Antigravity router settings: ${e.message}` }; }
   const selectedModel = model || settings.model;
-  if (!path.isAbsolute(root) || !fs.existsSync(root)) return { ready: false, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, message: 'Choose an existing absolute workspace.' };
+  if (!path.isAbsolute(root) || !fs.existsSync(root)) return { ready: false, ...verificationFields, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, message: 'Choose an existing absolute workspace.' };
   try {
     const gitRoot = (await git(root, 'rev-parse', '--show-toplevel')).trim();
     if (normalize(canonical(gitRoot)) !== normalize(canonical(root))) throw new Error('Workspace must be the repository root.');
@@ -113,9 +115,9 @@ export async function status(root, model) {
       await delay(250);
       return discoverModels(root);
     });
-    if (!models.includes(selectedModel)) return { ready: false, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, availableModels: models, message: 'Selected model is unavailable.' };
-    return { ready: true, model: selectedModel, preferredModel: settings.model, availableModels: models, transport: 'agy-cli-sandbox-worktree', maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, setupChecked: false, setupNote: 'Git status and model discovery passed. Snapshot and worktree creation are checked on submission.', restrictedVerification: false, restrictedVerificationReason: 'No verified OS-level execution provider is configured.' };
-  } catch (e) { return { ready: false, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, message: e.message }; }
+    if (!models.includes(selectedModel)) return { ready: false, ...verificationFields, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, availableModels: models, message: 'Selected model is unavailable.' };
+    return { ready: true, ...verificationFields, model: selectedModel, preferredModel: settings.model, availableModels: models, transport: 'agy-cli-sandbox-worktree', maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, setupChecked: false, setupNote: 'CLI, Git workspace, and model discovery passed. Verification readiness is reported separately; snapshot and worktree creation are checked on submission.' };
+  } catch (e) { return { ready: false, ...verificationFields, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, message: e.message }; }
 }
 
 function allowed(patterns) {

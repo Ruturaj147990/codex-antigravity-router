@@ -1,12 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { FailClosedExecutionProvider, TrustedLocalExecutionProvider, requireIsolatedProvider, requireAuthorizedProvider } from './execution-provider.mjs';
+import { FailClosedExecutionProvider, TrustedLocalExecutionProvider, requireIsolatedProvider, requireAuthorizedProvider, verificationReadiness } from './execution-provider.mjs';
 import { delegate } from './orchestrator.mjs';
 
 test('production verification fails closed without a restricted runner', async () => {
   const provider = new FailClosedExecutionProvider();
   await assert.rejects(requireIsolatedProvider(provider), /No verified OS-level restricted runner/);
   await assert.rejects(provider.run(), /Untrusted verification is unavailable/);
+});
+
+test('verification readiness explains the trusted-local opt-in before Codex restart', async () => {
+  const unavailable = await verificationReadiness({});
+  assert.equal(unavailable.ready, false);
+  assert.equal(unavailable.mode, 'fail-closed');
+  assert.equal(unavailable.requiredOptIn, 'CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE');
+  assert.match(unavailable.message, /set CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE=trusted-local before launching Codex and restart Codex/i);
+  const trusted = await verificationReadiness({ CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE: 'trusted-local' });
+  assert.equal(trusted.ready, true);
+  assert.equal(trusted.mode, 'trusted-local');
+  assert.equal(trusted.isolated, false);
+  assert.match(trusted.message, /not sandboxed/i);
 });
 
 test('the controller rejects a runner missing security capabilities', async () => {

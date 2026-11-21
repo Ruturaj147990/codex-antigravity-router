@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { availableModels, cancelTask, dashboardAgents, delegate, disposeTask, integrateTask, recover, requestStopAllWorkers, status, waitForBatchChange } from './orchestrator.mjs';
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
 import { openBrowserDashboard } from './dashboard-web.mjs';
+import { verificationReadiness } from './execution-provider.mjs';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const DASHBOARD_URI = 'ui://antigravity-router/dashboard-v0.7.1.html';
@@ -22,7 +23,7 @@ export function resolveDelegationOptions(args, defaults = delegationDefaults()) 
     throw new Error('runMode must be fail-closed or trusted-local.');
   }
   if (args.runMode === 'trusted-local' && defaults.runMode !== 'trusted-local') {
-    throw new Error('Trusted-local verification requires the operator to set CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE=trusted-local before launching Codex.');
+    throw new Error('Trusted-local verification is not enabled for this Codex process. Set CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE=trusted-local before launching Codex and restart Codex, or configure a restricted verification provider.');
   }
   if (args.maxParallel !== undefined && (!Number.isSafeInteger(args.maxParallel) || args.maxParallel < 1 || args.maxParallel > defaults.maxWorkers)) {
     throw new Error(`maxParallel must be an integer from 1 to the configured maximum of ${defaults.maxWorkers}.`);
@@ -47,9 +48,9 @@ const task = { type: 'object', properties: {
 }, required: ['id', 'title', 'risk', 'instructions', 'allowedPaths', 'acceptanceCriteria'], additionalProperties: false };
 const tools = [
   { name: 'antigravity_dashboard', description: 'Start or reopen the Antigravity Router dashboard in a local browser and return its private loopback link.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'antigravity_dashboard_data', description: 'Read router settings and concise current worker state for the dashboard.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'antigravity_dashboard_data', description: 'Read router settings, concise current worker state, and controller-managed verification readiness before submitting work.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'antigravity_update_settings', description: 'Save delegation enabled state, model preference, and worker ceiling from the router dashboard.', inputSchema: { type: 'object', properties: { enabled: { type: 'boolean' }, maxWorkers: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, model: { type: 'string' } }, required: ['enabled', 'maxWorkers', 'model'], additionalProperties: false } },
-  { name: 'antigravity_status', description: 'Check the local CLI, model, and Git workspace.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, model: { type: 'string' } }, required: ['workspaceRoot'], additionalProperties: false } },
+  { name: 'antigravity_status', description: 'Check the local CLI, model, Git workspace, and verification readiness. `ready` covers CLI/Git; inspect `verificationReady` before submitting tasks with checks.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, model: { type: 'string' } }, required: ['workspaceRoot'], additionalProperties: false } },
   { name: 'delegate_antigravity_tasks', description: 'Submit up to the user-configured Antigravity worker limit (1–32). Codex chooses a lower maxParallel for dependent or overlapping work. The controller runs every supplied verification check in order. Trusted-local commands use normal Windows user permissions when configured.', inputSchema: { type: 'object', properties: {
     workspaceRoot: { type: 'string' }, model: { type: 'string' }, runMode: { type: 'string', enum: ['fail-closed', 'trusted-local'] }, executionMode: { type: 'string', enum: ['sequential', 'parallel'] }, maxParallel: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, timeoutSeconds: { type: 'integer', minimum: 60, maximum: 3600 }, waitSeconds: { type: 'integer', minimum: 0, maximum: 30, description: 'Maximum time to wait for this response; the durable batch ID is returned even if work continues.' },
     tasks: { type: 'array', minItems: 1, maxItems: 32, items: task }
@@ -70,7 +71,7 @@ async function call(name, args) {
     const dashboard = await openBrowserDashboard();
     return result({ ...dashboard, serverStarted: dashboard.listening, message: 'Open the private link in the in-app browser. If it cannot reach the dashboard, open the same link in Edge or Chrome on this computer. Request a fresh link if the router has restarted.' });
   }
-  if (name === 'antigravity_dashboard_data') return result({ settings: readUserSettings(), models: await availableModels(), agents: dashboardAgents() });
+  if (name === 'antigravity_dashboard_data') return result({ settings: readUserSettings(), models: await availableModels(), agents: dashboardAgents(), verification: await verificationReadiness() });
   if (name === 'antigravity_update_settings') {
     const model = validatePreferredModel(args.model, 'model');
     if (!Number.isSafeInteger(args.maxWorkers) || args.maxWorkers < 1 || args.maxWorkers > MAX_WORKERS_LIMIT || typeof args.enabled !== 'boolean') throw new Error('Invalid dashboard settings.');
@@ -103,7 +104,7 @@ async function handle(message) {
   try {
     let value;
     switch (message.method) {
-      case 'initialize': value = { protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION, capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'codex-antigravity-router', version: '1.0.3' } }; break;
+      case 'initialize': value = { protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION, capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'codex-antigravity-router', version: '1.0.4' } }; break;
       case 'ping': value = {}; break;
       case 'tools/list': value = { tools }; break;
       case 'resources/list': value = { resources: [{ uri: DASHBOARD_URI, name: 'Antigravity Router Dashboard', mimeType: 'text/html;profile=mcp-app' }] }; break;

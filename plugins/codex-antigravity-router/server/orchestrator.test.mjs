@@ -50,7 +50,7 @@ test('installed defaults honor a configurable model and worker ceiling', (t) => 
   const env = { CODEX_HOME: home, CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE: 'trusted-local', CODEX_ANTIGRAVITY_MAX_WORKERS: '6', CODEX_ANTIGRAVITY_MODEL: 'gemini-3.8-flash-medium' };
   const defaults = delegationDefaults(env);
   assert.equal(defaults.runMode, 'trusted-local');
-  assert.throws(() => resolveDelegationOptions({ runMode: 'trusted-local' }, { ...defaults, runMode: 'fail-closed' }), /requires the operator/);
+  assert.throws(() => resolveDelegationOptions({ runMode: 'trusted-local' }, { ...defaults, runMode: 'fail-closed' }), /not enabled.*restart Codex/i);
   assert.equal(defaults.maxWorkers, 6);
   assert.equal(defaults.model, 'gemini-3.8-flash-medium');
   const options = resolveDelegationOptions({ tasks: Array.from({ length: 7 }) }, defaults);
