@@ -2,7 +2,7 @@
 
 A Codex desktop plugin that sends scoped engineering tasks to an authenticated Antigravity CLI. Codex chooses the task boundaries and acceptance checks. The router runs independent workers in separate Git worktrees, checks paths and results, and pauses higher-risk changes for review.
 
-[Website](https://antigravity-task-router.waxyhedgehog16.chatgpt.site/) · [Feedback](https://antigravity-task-router.waxyhedgehog16.chatgpt.site/feedback.html) · [MIT license](LICENSE)
+[Website](https://antigravity-task-router.vercel.app/) · [Feedback](https://antigravity-task-router.vercel.app/feedback.html) · [MIT license](LICENSE)
 
 ## Requirements
 

@@ -13,14 +13,14 @@
         "displayName": "Antigravity Task Router",
         "shortDescription": "Route tasks to Antigravity",
         "longDescription": "Codex retains architecture and risk decisions while Antigravity investigates, implements, tests, and repairs scoped tasks in isolated worktrees. Users configure their preferred model and worker ceiling; Codex chooses how many independent tasks to run up to that ceiling.",
-        "websiteURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site",
-        "supportURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site/feedback.html",
-        "privacyPolicyURL": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site/privacy.html",
+        "websiteURL": "https://antigravity-task-router.vercel.app",
+        "supportURL": "https://antigravity-task-router.vercel.app/feedback.html",
+        "privacyPolicyURL": "https://antigravity-task-router.vercel.app/privacy.html",
         "developerName": "Ruturaj Limbkar"
       }
     }
   },
   "license": "MIT",
-  "homepage": "https://antigravity-task-router.waxyhedgehog16.chatgpt.site",
+  "homepage": "https://antigravity-task-router.vercel.app",
   "repository": "https://github.com/Ruturaj147990/codex-antigravity-router"
 }
