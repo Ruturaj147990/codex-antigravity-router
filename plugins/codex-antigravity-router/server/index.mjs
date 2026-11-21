@@ -39,6 +39,7 @@ const task = { type: 'object', properties: {
   context: { type: 'string', description: 'Only decision-relevant context and references.' },
   instructions: { type: 'string', description: 'Coherent engineering outcome and constraints.' },
   allowedPaths: { type: 'array', items: { type: 'string' }, description: 'Bounded relative file paths or patterns. Exact paths permit concurrent editing.' },
+  contextPaths: { type: 'array', items: { type: 'string' }, description: 'Untracked files or directories needed for read-only context. Changes outside allowedPaths are rejected.' },
   acceptanceCriteria: { type: 'array', items: { type: 'string' } },
   dependsOn: { type: 'array', items: { type: 'string' }, description: 'Earlier task IDs; ready tasks execute FIFO.' },
   parallelSafe: { type: 'boolean', description: 'Legacy caller hint; actual isolation and conflict checks are enforced by the controller.' },
@@ -65,7 +66,10 @@ const tools = [
 ];
 const result = (value, isError = false) => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, isError });
 async function call(name, args) {
-  if (name === 'antigravity_dashboard') return result({ serverStarted: true, browserOpened: false, ...(await openBrowserDashboard()), message: 'The local dashboard server is listening. Open the temporary link in a browser on this computer.' });
+  if (name === 'antigravity_dashboard') {
+    const dashboard = await openBrowserDashboard();
+    return result({ ...dashboard, serverStarted: dashboard.listening, message: 'Open the private link in the in-app browser. If it cannot reach the dashboard, open the same link in Edge or Chrome on this computer. Request a fresh link if the router has restarted.' });
+  }
   if (name === 'antigravity_dashboard_data') return result({ settings: readUserSettings(), models: await availableModels(), agents: dashboardAgents() });
   if (name === 'antigravity_update_settings') {
     const model = validatePreferredModel(args.model, 'model');
@@ -79,7 +83,7 @@ async function call(name, args) {
   if (name === 'delegate_antigravity_tasks') {
     if (args.timeoutSeconds !== undefined && (!Number.isInteger(args.timeoutSeconds) || args.timeoutSeconds < 60 || args.timeoutSeconds > 3600)) throw new Error('timeoutSeconds must be 60–3600.');
     const defaults = delegationDefaults();
-    const options = resolveDelegationOptions(args, defaults);
+    const options = resolveDelegationOptions({ waitSeconds: 0, ...args }, defaults);
     const out = await delegate(args.workspaceRoot, args.tasks, options);
     return result(out, out.results.some((item) => ['needs_review', 'conflict'].includes(item.status)));
   }

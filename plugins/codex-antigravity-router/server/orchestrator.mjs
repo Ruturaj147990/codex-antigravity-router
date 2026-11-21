@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { acquire, canonical, changed, createWorker, disposeWorker, git, globalRoot, hash, integrate, key, load, managedCheckout, persist, safeFile, snapshot, stateRoot } from './worktrees.mjs';
+import { acquire, canonical, changed, createWorker, disposeWorker, git, globalRoot, hash, integrate, key, load, managedCheckout, persist, safeFile, snapshot, stateRoot, withGitLogs } from './worktrees.mjs';
 import { configuredExecutionProvider, requireAuthorizedProvider } from './execution-provider.mjs';
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
 
@@ -13,42 +13,91 @@ const CLI = process.env.CODEX_ANTIGRAVITY_CLI || path.join(os.homedir(), '.gemin
 const now = () => new Date().toISOString();
 const alive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 const normalize = (p) => key(path.resolve(p));
-let batchQueue = Promise.resolve();
-let queuedBatchCount = 0;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function discoverModels(cwd, timeout = 6000) {
+  try {
+    const { stdout } = await exec(CLI, ['models'], { cwd, windowsHide: true, timeout });
+    const models = stdout.split(/\r?\n/).map((line) => line.trim().split(/\s+/)[0])
+      .filter((model) => /^[a-zA-Z0-9._-]+$/.test(model));
+    if (!models.length) throw new Error('No model IDs returned.');
+    return models;
+  } catch (error) {
+    const tail = [error.stdout, error.stderr].filter(Boolean).join('\n').trim().slice(-500);
+    throw new Error(`Model discovery failed (exit: ${error.code ?? 'unavailable'}, timeout: ${error.killed === true}). ${tail || 'No CLI output.'}`);
+  }
+}
+const batchQueues = new Map();
 const activeWorkerPids = new Set();
 const scheduledBatches = new Set();
-let integrationQueue = Promise.resolve();
-function enqueueBatch(batchId, run) {
-  queuedBatchCount++;
-  const position = queuedBatchCount;
+function enqueueBatch(root, batchId, run) {
+  const repo = stateRoot(root);
+  const queue = batchQueues.get(repo) || { tail: Promise.resolve(), waiting: 0 };
+  batchQueues.set(repo, queue);
+  const position = ++queue.waiting;
   scheduledBatches.add(batchId);
-  const completion = batchQueue.then(async () => { queuedBatchCount--; return run(); }).finally(() => scheduledBatches.delete(batchId));
-  batchQueue = completion.catch(() => {});
+  const completion = queue.tail.then(async () => {
+    queue.waiting--;
+    const release = await waitForLock(path.join(repo, 'scheduler'));
+    try { return await run(); }
+    finally { release(); }
+  }).finally(() => {
+    scheduledBatches.delete(batchId);
+    if (queue.tail === tail) batchQueues.delete(repo);
+  });
+  const tail = completion.catch(() => {});
+  queue.tail = tail;
   return { completion, position };
 }
-async function integrateWithControllerLock(root, worker, snap, files) {
-  let unlock;
-  const previous = integrationQueue;
-  integrationQueue = new Promise((resolve) => { unlock = resolve; });
-  await previous;
-  try {
-    const release = acquire(globalRoot());
-    try { return await integrate(root, worker, snap, files); }
-    finally { release(); }
-  } finally { unlock(); }
+function tryLock(folder) {
+  try { return acquire(folder); }
+  catch (error) { if (!/^A router controller is active/.test(error.message)) throw error; return null; }
 }
-function liveUnownedWorkers() {
+async function waitForLock(folder) {
+  while (true) {
+    const release = tryLock(folder);
+    if (release) return release;
+    await delay(100);
+  }
+}
+async function integrateWithControllerLock(root, worker, snap, files) {
+  const release = await waitForLock(path.join(stateRoot(root), 'mutation'));
+  try { return await integrate(root, worker, snap, files); }
+  finally { release(); }
+}
+function* persistedBatches() {
   const base = globalRoot();
-  if (!fs.existsSync(base)) return [];
-  const found = [];
+  if (!fs.existsSync(base)) return;
   for (const repo of fs.readdirSync(base, { withFileTypes: true })) if (repo.isDirectory())
     for (const batch of fs.readdirSync(path.join(base, repo.name), { withFileTypes: true })) if (batch.isDirectory()) {
       const file = path.join(base, repo.name, batch.name, 'state.json');
       if (!fs.existsSync(file)) continue;
-      const state = load(file);
-      for (const t of state.tasks || []) if (alive(t.pid) && !activeWorkerPids.has(t.pid)) found.push({ batchId: state.batchId, taskId: t.id, pid: t.pid });
+      yield load(file);
     }
+}
+function liveUnownedWorkers() {
+  const found = [];
+  for (const state of persistedBatches()) for (const t of state.tasks || []) {
+    if (alive(t.pid) && !activeWorkerPids.has(t.pid) && !(state.controllerPid !== process.pid && alive(state.controllerPid) && t.slotHeld)) found.push({ batchId: state.batchId, taskId: t.id, pid: t.pid });
+  }
   return found;
+}
+function claimSlot(state, task, save) {
+  const release = tryLock(path.join(globalRoot(), 'dispatch'));
+  if (!release) return false;
+  try {
+    const settings = readUserSettings();
+    if (!settings.enabled) return false;
+    let used = 0;
+    for (const batch of persistedBatches()) for (const item of batch.tasks || []) {
+      if ((item.slotHeld && alive(batch.controllerPid)) || alive(item.pid)) used++;
+    }
+    if (used >= settings.maxWorkers) return false;
+    task.slotHeld = true;
+    task.status = 'starting';
+    task.dispatchedAt = now();
+    save();
+    return true;
+  } finally { release(); }
 }
 
 export async function status(root, model) {
@@ -60,10 +109,12 @@ export async function status(root, model) {
   try {
     const gitRoot = (await git(root, 'rev-parse', '--show-toplevel')).trim();
     if (normalize(canonical(gitRoot)) !== normalize(canonical(root))) throw new Error('Workspace must be the repository root.');
-    const { stdout } = await exec(CLI, ['models'], { cwd: root, windowsHide: true, timeout: 20000 });
-    const models = stdout.split(/\r?\n/).map((line) => line.trim().split(/\s+/)[0]).filter(Boolean);
+    const models = await discoverModels(root).catch(async () => {
+      await delay(250);
+      return discoverModels(root);
+    });
     if (!models.includes(selectedModel)) return { ready: false, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, availableModels: models, message: 'Selected model is unavailable.' };
-    return { ready: true, model: selectedModel, preferredModel: settings.model, availableModels: models, transport: 'agy-cli-sandbox-worktree', maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, restrictedVerification: false, restrictedVerificationReason: 'No verified OS-level execution provider is configured.' };
+    return { ready: true, model: selectedModel, preferredModel: settings.model, availableModels: models, transport: 'agy-cli-sandbox-worktree', maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, setupChecked: false, setupNote: 'Git status and model discovery passed. Snapshot and worktree creation are checked on submission.', restrictedVerification: false, restrictedVerificationReason: 'No verified OS-level execution provider is configured.' };
   } catch (e) { return { ready: false, model: selectedModel, preferredModel: settings.model, maxWorkers: settings.maxWorkers, settingsFile: settings.settingsFile, message: e.message }; }
 }
 
@@ -100,7 +151,7 @@ function validate(tasks) {
     if (t.dependsOn && (!Array.isArray(t.dependsOn) || t.dependsOn.some((d) => !seen.has(d)))) throw new Error(`Task ${t.id} has an unknown or forward dependency.`);
     const commands = t.verificationCommands || [];
     if (!Array.isArray(commands) || commands.some((c) => !Array.isArray(c) || !c.length || c.some((v) => typeof v !== 'string'))) throw new Error(`Task ${t.id} has invalid verification commands.`);
-    return { ...t, risk: t.risk === 'low' ? 'LOW_RISK' : t.risk, allowedPaths: allowed(t.allowedPaths), dependsOn: t.dependsOn || [], verificationCommands: commands, status: 'queued', createdAt: now() };
+    return { ...t, risk: t.risk === 'low' ? 'LOW_RISK' : t.risk, allowedPaths: allowed(t.allowedPaths), contextPaths: t.contextPaths?.length ? allowed(t.contextPaths) : [], dependsOn: t.dependsOn || [], verificationCommands: commands, status: 'queued', createdAt: now() };
   });
 }
 function overlaps(a, b) {
@@ -114,6 +165,7 @@ export function buildAgentPrompt(worker, t, retry = '') {
   return [
     `Task: ${t.title} [${t.risk}]`,
     `Work only in the isolated Git worktree at ${worker}. The original checkout is authoritative; do not access it.`,
+    'Use only file tools within the assigned worktree. Do not use MCP tools, external lookup, terminal, notebook, or code execution. Use any dependency research supplied in the task context.',
     `Follow AGENTS.md. ${t.context || ''}`,
     t.instructions,
     `Allowed edits: ${t.allowedPaths.join(', ')}.`,
@@ -123,7 +175,7 @@ export function buildAgentPrompt(worker, t, retry = '') {
     retry ? `Independent verification failed: ${retry}. Diagnose and repair within the same worktree, then report the result.` : ''
   ].filter(Boolean).join('\n');
 }
-function runCli(worker, t, model, timeout, retry, onPid, cancelFile) {
+function runCli(worker, t, model, timeout, retry, onPid, cancelFile, snap, save) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const settings = JSON.stringify({ permissions: { allow: [`read_file(${worker})`, `write_file(${worker})`] } });
@@ -131,15 +183,62 @@ function runCli(worker, t, model, timeout, retry, onPid, cancelFile) {
     const args = ['--sandbox', '--settings', settings, '--output-format', 'stream-json', '--mode', 'accept-edits', '--model', model, '--print-timeout', `${timeout}s`, '--print', brief];
     const child = spawn(CLI, args, { cwd: worker, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     onPid(child.pid);
-    let buffer = '', stderr = '', result = null, observedCwd = null, denied = [], tools = [], timedOut = false, cancelled = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout * 1000 + 15000);
-    const cancellation = setInterval(() => { if (fs.existsSync(cancelFile) && !cancelled) { cancelled = true; child.kill(); if (process.platform === 'win32' && child.pid) exec('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true }).catch(() => {}); } }, 250);
-    const line = (s) => { try { const e = JSON.parse(s); if (e.event === 'init') observedCwd = e.init?.cwd || null; if (e.event === 'result') { result = e.result; denied = result?.denied_actions || []; } if (e.event === 'step_update' && e.step_update?.step_type === 'tool') tools.push({ name: e.step_update.tool_info?.name, state: e.step_update.state }); } catch {} };
+    let buffer = '', stderr = '', result = null, observedCwd = null, denied = [], tools = [], timedOut = false, cancelled = false, noProgress = false, closed = false;
+    const terminate = () => {
+      if (process.platform === 'win32' && child.pid) exec('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true }).catch(() => child.kill());
+      else child.kill();
+    };
+    const timer = setTimeout(() => { timedOut = true; terminate(); }, timeout * 1000 + 15000);
+    const cancellation = setInterval(() => { if (fs.existsSync(cancelFile) && !cancelled) { cancelled = true; terminate(); } }, 250);
+    const budget = Number(process.env.CODEX_ANTIGRAVITY_NO_EDIT_SECONDS || 0);
+    const progressTimer = Number.isSafeInteger(budget) && budget > 0 && budget < timeout ? setTimeout(async () => {
+      // Only stop when the worktree can be inspected and still has no edits.
+      const edits = await changed(worker, snap).catch(() => null);
+      if (!closed && !cancelled && edits?.length === 0) { noProgress = true; terminate(); }
+    }, budget * 1000) : null;
+    let lastProgress = 0;
+    const line = (s) => {
+      let event;
+      try { event = JSON.parse(s); } catch { return; }
+      if (event.event === 'init') observedCwd = event.init?.cwd || null;
+      if (event.event === 'result') { result = event.result; denied = result?.denied_actions || []; }
+      const step = event.step_update;
+      const name = step?.tool_info?.name;
+      if (event.event === 'step_update' && step?.step_type === 'tool') {
+        tools.push({ name, state: step.state });
+        if (['read_file', 'write_file', 'edit_file', 'replace_file_content', 'multi_replace_file_content'].includes(name)) {
+          t.lastFileTool = name;
+          t.lastFileActivityAt = now();
+        }
+      }
+      const tokens = event.usage?.total_tokens ?? step?.usage?.total_tokens;
+      if (Number.isSafeInteger(tokens) && tokens >= 0) t.liveTokens = tokens;
+      if ((t.lastFileTool || t.liveTokens !== undefined) && Date.now() - lastProgress >= 1000 && !closed) {
+        lastProgress = Date.now();
+        save();
+      }
+    };
     child.stdout.on('data', (c) => { buffer += c; let n; while ((n = buffer.indexOf('\n')) >= 0) { line(buffer.slice(0, n)); buffer = buffer.slice(n + 1); } if (buffer.length > 4000000) buffer = ''; });
     child.stderr.on('data', (c) => { stderr = (stderr + c).slice(-3000); });
     child.on('error', (e) => { stderr = e.message; });
-    child.on('close', (code) => { clearTimeout(timer); clearInterval(cancellation); line(buffer); resolve({ code, timedOut, cancelled, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length, durationMs: Date.now() - startedAt }); });
+    child.on('close', (code) => { closed = true; clearTimeout(timer); clearInterval(cancellation); clearTimeout(progressTimer); line(buffer); resolve({ code, timedOut, cancelled, noProgress, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length, durationMs: Date.now() - startedAt }); });
   });
+}
+export function describeDenial(denial, worker) {
+  const item = typeof denial === 'string' ? { action: denial } : denial || {};
+  const identifier = (value) => typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_.:-]{0,79}$/.test(value) ? value : 'not reported';
+  const target = item.path || item.scope || item.target;
+  let scope = 'unspecified';
+  if (typeof target === 'string' && target) {
+    const candidate = path.resolve(worker, target);
+    const relative = path.relative(worker, candidate);
+    if (path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) scope = '[outside assigned worktree]';
+    else if (relative && /^[a-zA-Z0-9_./ -]+$/.test(relative.replaceAll('\\', '/'))) scope = relative.replaceAll('\\', '/').slice(0, 180);
+    else scope = '[assigned worktree]';
+  }
+  const phase = identifier(item.phase || item.stage || item.state);
+  const executed = item.executed === true ? 'yes' : item.executed === false ? 'no' : 'unknown';
+  return `${identifier(item.action || item.tool)}; server=${identifier(item.server || item.mcp_server)}; tool=${identifier(item.tool || item.tool_name)}; rule=${identifier(item.rule || item.reason)}; scope=${scope}; phase=${phase}; executed=${executed}`;
 }
 export function quotaExhaustionReason(run) {
   const text = [run?.stderr, run?.result?.response, run?.result?.message, run?.result?.error, run?.result?.status].filter(Boolean).join('\n');
@@ -161,7 +260,7 @@ export function dashboardAgents() {
   for (const repo of fs.readdirSync(base, { withFileTypes: true })) if (repo.isDirectory())
     for (const batch of fs.readdirSync(path.join(base, repo.name), { withFileTypes: true })) if (batch.isDirectory()) {
       const file = path.join(base, repo.name, batch.name, 'state.json'); if (!fs.existsSync(file)) continue;
-      try { const state = load(file); for (const task of state.tasks || []) { const live = active.has(task.status) && alive(task.pid); const completedAt = timestamp(task.finishedAt || task.createdAt); const recentDone = recent.has(task.status) && Number.isFinite(completedAt) && Date.now() - completedAt >= 0 && Date.now() - completedAt < 600000; if (live || recentDone) rows.push({ name: `Worker ${task.id}`, task: String(task.title || task.id).slice(0, 100), phase: task.status, live, workspace: path.basename(state.root), model: state.model || 'unknown', startedAt: task.startedAt || null }); } } catch {}
+      try { const state = load(file); for (const task of state.tasks || []) { const live = active.has(task.status) && alive(task.pid); const completedAt = timestamp(task.finishedAt || task.createdAt); const recentDone = recent.has(task.status) && Number.isFinite(completedAt) && Date.now() - completedAt >= 0 && Date.now() - completedAt < 600000; if (live || recentDone) rows.push({ name: `Worker ${task.id}`, task: String(task.title || task.id).slice(0, 100), phase: task.status, live, workspace: path.basename(state.root), model: state.model || 'unknown', startedAt: task.startedAt || null, ...(state.batchId ? { batchId: state.batchId } : {}), ...(task.lastFileTool ? { lastFileTool: task.lastFileTool, lastFileActivityAt: task.lastFileActivityAt } : {}), ...(task.liveTokens !== undefined || task.antigravityTokens ? { tokens: live ? task.liveTokens : task.antigravityTokens || task.liveTokens } : {}) }); } } catch {}
     }
   return rows.slice(0, MAX_WORKERS_LIMIT);
 }
@@ -177,7 +276,7 @@ export function requestStopAllWorkers(reason = 'delegation disabled') {
 let modelCache = { at: 0, values: [] };
 export async function availableModels() {
   if (Date.now() - modelCache.at < 300000 && modelCache.values.length) return modelCache.values;
-  try { const { stdout } = await exec(CLI, ['models'], { cwd: os.homedir(), windowsHide: true, timeout: 20000 }); modelCache = { at: Date.now(), values: stdout.split(/\r?\n/).map((line) => line.trim().split(/\s+/)[0]).filter((model) => /^[a-zA-Z0-9._-]+$/.test(model)) }; return modelCache.values; }
+  try { modelCache = { at: Date.now(), values: await discoverModels(os.homedir()) }; return modelCache.values; }
   catch { return modelCache.values; }
 }
 function stopBatchForQuota(folder, state, currentTask, reason, save) {
@@ -211,15 +310,18 @@ async function verify(worker, t, timeout, provider) {
   return checks;
 }
 async function execute(root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot) {
-  t.status = 'preparing'; save();
+  t.status = 'preparing'; t.setupPhase = 'workspace planning'; t.workerLaunched = false; save();
   const cancelFile = path.join(folder, `${t.id}.cancel`);
   const worker = await managedCheckout(root, state.batchId, state.tasks.indexOf(t));
   t.worker = worker; save();
+  t.setupPhase = 'source snapshot'; save();
   const prepared = await getSnapshot(t);
   const { snap, snapshotFile } = prepared;
   t.snapshotDurationMs = prepared.createdForTask === t.id ? prepared.durationMs : 0;
   t.snapshotFile = snapshotFile; save();
+  t.setupPhase = 'worktree creation'; save();
   await createWorker(root, folder, t.id, snap, worker);
+  t.setupPhase = 'worker ready'; save();
   if (fs.existsSync(cancelFile)) { t.status = 'cancelled'; save(); return; }
   t.status = 'running'; t.startedAt = now(); save();
   let reply = '', run, edits = [], checks = [];
@@ -227,8 +329,9 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     t.attempts = attempt + 1; save();
     const retry = attempt ? t.verificationFailure : '';
     const attemptStartedAt = Date.now();
-    const trackPid = (pid) => { if (pid) activeWorkerPids.add(pid); t.pid = pid; save(); };
-    try { run = await (workerRunner ? workerRunner({ worker, task: t, model, timeout, retry, onPid: trackPid, cancelFile }) : runCli(worker, t, model, timeout, retry, trackPid, cancelFile)); }
+    delete t.liveTokens;
+    const trackPid = (pid) => { if (pid) { activeWorkerPids.add(pid); t.workerLaunched = true; } t.pid = pid; save(); };
+    try { run = await (workerRunner ? workerRunner({ worker, task: t, model, timeout, retry, onPid: trackPid, cancelFile }) : runCli(worker, t, model, timeout, retry, trackPid, cancelFile, snap, save)); }
     finally { if (t.pid) activeWorkerPids.delete(t.pid); }
     t.briefCharacters = (t.briefCharacters || 0) + run.briefCharacters;
     t.workerDurationMs = (t.workerDurationMs || 0) + (Number.isFinite(run.durationMs) ? run.durationMs : Date.now() - attemptStartedAt);
@@ -240,6 +343,7 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     t.responseCharacters = (t.responseCharacters || 0) + rawReply.length;
     reply = rawReply.slice(0, 1800);
     edits = await changed(worker, snap);
+    if (run.noProgress) { t.noProgress = true; t.status = 'needs_review'; t.error = 'No file edits observed before the configured budget. Worktree preserved for review.'; break; }
     if (run.timedOut && edits.length === 0) t.zeroEditTimeouts = (t.zeroEditTimeouts || 0) + 1;
     const quota = quotaExhaustionReason(run);
     if (quota) {
@@ -254,13 +358,8 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     const commandTools = run.tools.filter((x) => /run_command|send_command_input|notebook_execution/i.test(x.name || ''));
     if (run.timedOut || run.code !== 0 || run.result?.status !== 'SUCCESS' || !cwdOk || run.denied.length || scope.length || commandTools.length) {
       t.status = 'needs_review';
-      const deniedDetails = run.denied.map((d) => {
-        const item = typeof d === 'string' ? { action: d } : d || {};
-        const scopePath = item.path || item.scope || item.target;
-        const relativeScope = typeof scopePath === 'string' && path.isAbsolute(scopePath) ? (normalize(scopePath).startsWith(`${normalize(worker)}${path.sep}`) ? path.relative(worker, scopePath).replaceAll('\\', '/') : '[outside assigned worktree]') : String(scopePath || 'unspecified');
-        return `${String(item.action || item.tool || 'unknown tool').slice(0, 80)}; rule=${String(item.rule || item.reason || 'not reported').slice(0, 120)}; scope=${relativeScope}; executed=${item.executed === true ? 'yes' : 'no/unknown'}`;
-      });
-      t.error = run.timedOut ? 'CLI timeout' : !cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? `Command side effects need review: ${commandTools.map((x) => `${x.name || 'command'} (${x.state || 'state unknown'})`).join(', ')}` : run.denied.length ? `CLI permission denials: ${deniedDetails.join(' | ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`;
+      const deniedDetails = run.denied.map((denial) => describeDenial(denial, worker));
+      t.error = run.denied.length ? `CLI permission denials: ${deniedDetails.slice(0, 8).join(' | ')}` : run.timedOut ? 'CLI timeout' : !cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? `Command side effects need review: ${commandTools.map((x) => `${x.name || 'command'} (${x.state || 'state unknown'})`).join(', ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`;
       break;
     }
     if (/^\s*ESCALATE_RISK:/i.test(reply)) { t.status = 'needs_review'; t.error = 'Worker escalated risk or scope'; break; }
@@ -289,15 +388,32 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
   else { t.status = 'completed'; state.invalidateSnapshot?.(); }
   save();
 }
-function report(state) { return { batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
-async function schedule(state, folder, model, timeout, provider, workerRunner) {
-  const save = () => { state.revision = (state.revision || 0) + 1; state.updatedAt = now(); persist(state.stateFile, state); };
-  let snapshotGeneration = 0, snapshotPromise = null, snapshotDurationMs = 0;
+function report(state) { return { batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, setupPhase: t.setupPhase || null, workerLaunched: t.workerLaunched === true, workerPathStatus: t.worker ? (fs.existsSync(t.worker) ? 'exists' : 'planned_only') : 'unavailable', retryPossible: t.status === 'needs_review' && !t.workerLaunched && (!t.worker || !fs.existsSync(t.worker)), noProgress: t.noProgress || undefined, lastFileTool: t.lastFileTool, lastFileActivityAt: t.lastFileActivityAt, antigravityTokens: t.antigravityTokens || t.liveTokens || undefined, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
+async function schedule(state, folder, model, timeout, provider, workerRunner, snapshotFn = snapshot) {
+  const taskVersions = new Map();
+  const save = () => {
+    state.revision = (state.revision || 0) + 1;
+    for (const task of state.tasks) {
+      const { changedAtRevision, ...fields } = task;
+      const version = JSON.stringify(fields);
+      if (taskVersions.get(task.id) !== version) {
+        task.changedAtRevision = state.revision;
+        taskVersions.set(task.id, version);
+      }
+    }
+    state.updatedAt = now();
+    persist(state.stateFile, state);
+  };
+  let snapshotPromise = null, snapshotDurationMs = 0;
   const getSnapshot = async (task) => {
     if (!snapshotPromise) {
-      const generation = snapshotGeneration;
+      const generation = crypto.randomUUID();
       const startedAt = Date.now();
-      snapshotPromise = snapshot(state.root).then((snap) => {
+      snapshotPromise = (async () => {
+        const release = await waitForLock(path.join(stateRoot(state.root), 'mutation'));
+        try { return await snapshotFn(state.root, state.tasks.flatMap((item) => [...item.allowedPaths, ...(item.contextPaths || [])])); }
+        finally { release(); }
+      })().then((snap) => {
         const durationMs = Date.now() - startedAt;
         snapshotDurationMs += durationMs;
         state.snapshotPreparations = (state.snapshotPreparations || 0) + 1;
@@ -309,7 +425,9 @@ async function schedule(state, folder, model, timeout, provider, workerRunner) {
     }
     return snapshotPromise;
   };
-  state.invalidateSnapshot = () => { snapshotGeneration++; snapshotPromise = null; };
+  state.invalidateSnapshot = () => { snapshotPromise = null; };
+  delete state.finishedAt;
+  state.controllerPid = process.pid;
   state.batchStatus = 'running'; save();
   const running = new Set();
   const jobs = new Map();
@@ -317,7 +435,7 @@ async function schedule(state, folder, model, timeout, provider, workerRunner) {
   const requestedWorkers = Number.isSafeInteger(state.maxParallel) ? state.maxParallel : 1;
   const capacity = Math.max(1, Math.min(MAX_WORKERS_LIMIT, configuredWorkers, requestedWorkers));
   while (true) {
-    let started = false;
+    let waitingForSlot = false;
     for (const [index, t] of state.tasks.entries()) {
       if (running.size >= capacity) break;
       if (!readUserSettings().enabled) {
@@ -330,13 +448,18 @@ async function schedule(state, folder, model, timeout, provider, workerRunner) {
       if (t.dependsOn.some((id) => state.tasks.find((x) => x.id === id)?.status !== 'completed')) continue;
       if (state.tasks.slice(0, index).some((x) => ['awaiting_integration', 'conflict', 'needs_review'].includes(x.status) && overlaps(x, t))) continue;
       if ([...running].some((x) => overlaps(x, t))) continue;
-      t.status = 'starting'; t.dispatchedAt = now(); save(); started = true;
-      const job = execute(state.root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot).catch((e) => { t.status = 'needs_review'; t.error = e.message; t.finishedAt = now(); save(); }).finally(() => { running.delete(t); });
+      if (!claimSlot(state, t, save)) { waitingForSlot = true; break; }
+      const job = withGitLogs(folder, () => execute(state.root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot)).catch((e) => { t.status = 'needs_review'; t.error = `Setup/worker phase ${t.setupPhase || 'scheduling'}: ${e.message}`; t.finishedAt = now(); save(); }).finally(() => {
+        t.slotHeld = false;
+        running.delete(t);
+        save();
+      });
       jobs.set(t.id, job); running.add(t);
     }
-    if (!running.size) break;
-    await Promise.race([...running].map((t) => jobs.get(t.id)));
-    if (!started) continue;
+    if (!running.size && !waitingForSlot) break;
+    const pending = [...running].map((t) => jobs.get(t.id));
+    if (waitingForSlot) pending.push(delay(100));
+    await Promise.race(pending);
   }
   for (const t of state.tasks) if (t.status === 'queued') { t.status = 'blocked'; t.error = 'A dependency or earlier overlapping task needs completion or review.'; }
   state.snapshotDurationMs = snapshotDurationMs;
@@ -370,7 +493,7 @@ export async function delegate(root, rawTasks, options = {}) {
     }
   }
   if (!options.workerRunner) { const ready = await status(root, model); if (!ready.ready) throw new Error(ready.message); }
-  const base = stateRoot(root), release = acquire(globalRoot());
+  const base = stateRoot(root), release = await waitForLock(path.join(base, 'mutation'));
   let lockHeld = true;
   try {
     const orphans = liveUnownedWorkers();
@@ -378,10 +501,10 @@ export async function delegate(root, rawTasks, options = {}) {
     const batchId = crypto.randomUUID(), folder = path.join(base, batchId);
     fs.mkdirSync(folder, { recursive: true });
     await managedCheckout(root, batchId, 0);
-    const state = { version: 1, batchId, root: canonical(root), model, timeout, runMode, maxWorkers: settings.maxWorkers, maxParallel, revision: 0, batchStatus: 'queued', createdAt: now(), tasks };
+    const state = { version: 1, batchId, root: canonical(root), model, timeout, runMode, maxWorkers: settings.maxWorkers, maxParallel, revision: 0, controllerPid: process.pid, batchStatus: 'queued', createdAt: now(), tasks };
     state.stateFile = path.join(folder, 'state.json'); persist(state.stateFile, state);
     release(); lockHeld = false;
-    const queued = enqueueBatch(batchId, () => schedule(state, folder, model, timeout, provider, options.workerRunner));
+    const queued = enqueueBatch(root, batchId, () => schedule(state, folder, model, timeout, provider, options.workerRunner, options.snapshotFn));
     const completion = queued.completion.catch((error) => { state.controllerError = String(error.message || error).slice(0, 500); state.finishedAt = now(); state.batchStatus = 'failed'; persist(state.stateFile, state); return report(state); });
     if (waitSeconds === 0) return { ...report(state), pending: true, queuePosition: queued.position };
     let timer;
@@ -401,24 +524,31 @@ export async function waitForBatchChange(root, batchId, cursor, waitSeconds = 20
   if (normalize(initial.root) !== normalize(canonical(root))) throw new Error('Batch belongs to a different workspace.');
   const deadline = Date.now() + waitSeconds * 1000;
   let state = initial;
-  while (state.revision === cursor && Date.now() < deadline && !state.finishedAt) {
+  while ((state.revision || 0) === cursor && Date.now() < deadline && !state.finishedAt) {
     await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
     state = load(file);
   }
-  return { ...report(state), waitExpired: state.revision === cursor && !state.finishedAt };
+  const output = report(state);
+  output.results = output.results.filter((item, index) =>
+    (state.tasks[index].changedAtRevision ?? state.revision ?? 0) > cursor);
+  return { ...output, waitExpired: (state.revision || 0) === cursor && !state.finishedAt };
 }
 export async function recover(root, batchId, resume = false, executionProvider = null) {
   const base = stateRoot(root), folder = path.join(base, batchId), file = path.join(folder, 'state.json');
-  const state = load(file);
+  if (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch ID.');
+  let state = load(file);
   if (normalize(state.root) !== normalize(canonical(root))) throw new Error('Batch belongs to a different workspace.');
   if (!resume) return report(state);
   if (scheduledBatches.has(batchId)) return { ...report(state), warning: 'This batch is already queued or running in this router process; no duplicate worker dispatch was created.' };
-  const release = acquire(globalRoot());
+  const release = await waitForLock(path.join(base, 'mutation'));
   let lockHeld = true;
   try {
+    state = load(file);
+    if (scheduledBatches.has(batchId) || ((state.batchStatus === 'running' || state.batchStatus === 'queued') && alive(state.controllerPid))) return { ...report(state), warning: 'This batch is already queued or running.' };
     const orphans = liveUnownedWorkers();
     if (orphans.length) return { ...report(state), warning: `Live worker processes require inspection before queue recovery: ${JSON.stringify(orphans)}` };
     for (const t of state.tasks) if (['starting', 'preparing', 'running', 'retrying', 'verified', 'integrating'].includes(t.status)) {
+      t.slotHeld = false;
       t.status = 'needs_review';
       t.error = alive(t.pid) ? `Worker PID ${t.pid} may still be active; inspect before recovery.` : 'Interrupted task preserved; inspect its worktree before retrying.';
     }
@@ -428,15 +558,15 @@ export async function recover(root, batchId, resume = false, executionProvider =
     await managedCheckout(root, batchId, 0);
     const provider = executionProvider || await configuredExecutionProvider(state.runMode || 'fail-closed');
     if (state.tasks.some((t) => t.status === 'queued' && t.verificationCommands?.length)) await requireAuthorizedProvider(provider, state.runMode || 'fail-closed');
-    state.batchStatus = 'queued'; persist(file, state);
+    state.batchStatus = 'queued'; state.controllerPid = process.pid; delete state.finishedAt; persist(file, state);
     release(); lockHeld = false;
-    const queued = enqueueBatch(batchId, () => schedule(state, folder, state.model, state.timeout, provider));
+    const queued = enqueueBatch(root, batchId, () => schedule(state, folder, state.model, state.timeout, provider));
     return await queued.completion;
   } finally { if (lockHeld) release(); }
 }
 export async function integrateTask(root, batchId, taskId, executionProvider = null) {
   if (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch ID.');
-  const base = stateRoot(root), release = acquire(globalRoot());
+  const base = stateRoot(root), release = await waitForLock(path.join(base, 'mutation'));
   let lockHeld = true;
   try {
     const orphans = liveUnownedWorkers();
@@ -452,15 +582,16 @@ export async function integrateTask(root, batchId, taskId, executionProvider = n
     const result = await integrate(root, t.worker, snap, edits);
     if (!result.integrated) { t.status = 'conflict'; t.conflicts = result.conflicts; }
     else t.status = 'completed';
+    t.changedAtRevision = state.revision = (state.revision || 0) + 1;
     persist(file, state);
     if (result.integrated && state.tasks.some((item) => item.status === 'blocked')) {
       for (const item of state.tasks) if (item.status === 'blocked') { item.status = 'queued'; delete item.error; }
       persist(file, state);
       const provider = executionProvider || await configuredExecutionProvider(state.runMode || 'fail-closed');
       if (state.tasks.some((item) => item.status === 'queued' && item.verificationCommands?.length)) await requireAuthorizedProvider(provider, state.runMode || 'fail-closed');
-      state.batchStatus = 'queued'; persist(file, state);
+      state.batchStatus = 'queued'; state.controllerPid = process.pid; delete state.finishedAt; persist(file, state);
       release(); lockHeld = false;
-      const queued = enqueueBatch(batchId, () => schedule(state, path.dirname(file), state.model, state.timeout, provider));
+      const queued = enqueueBatch(root, batchId, () => schedule(state, path.dirname(file), state.model, state.timeout, provider));
       return await queued.completion;
     }
     return report(state);
@@ -480,10 +611,11 @@ export function cancelTask(root, batchId, taskId) {
   return { taskId, status: 'cancellation_requested', marker };
 }
 export async function disposeTask(root, batchId, taskId) {
-  const base = stateRoot(root), release = acquire(globalRoot());
+  const base = stateRoot(root), release = await waitForLock(path.join(base, 'mutation'));
   try {
     const file = path.join(base, batchId, 'state.json'), state = load(file);
     if (normalize(state.root) !== normalize(canonical(root))) throw new Error('Batch belongs to another workspace.');
+    if (state.batchStatus === 'running' && alive(state.controllerPid)) throw new Error('Wait for the batch to finish before disposing a worktree.');
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task || !['completed', 'cancelled'].includes(task.status)) throw new Error('Only completed or cancelled work can be disposed.');
     if (task.workerDisposedAt) return { taskId, disposed: true, alreadyDisposed: true, workerPath: task.workerPath };

@@ -30,6 +30,7 @@ export async function createDashboardServer({ host = '127.0.0.1', port = 0, toke
       if (req.headers.host !== `${host}:${server.address().port}`) return send(res, 421, { error: 'Use the dashboard link on this computer.' });
       if (req.headers.origin && req.headers.origin !== origin) return send(res, 403, { error: 'Cross-origin dashboard requests are blocked.' });
       const url = new URL(req.url || '/', origin);
+      if (req.method === 'GET' && url.pathname === '/health') return send(res, 204, '');
       if (req.method === 'GET' && url.pathname === '/') return send(res, 200, fs.readFileSync(htmlPath, 'utf8'), 'text/html; charset=utf-8');
       if (!['/api/dashboard', '/api/settings'].includes(url.pathname)) return send(res, 404, { error: 'Not found.' });
       if (!equalSecret(req.headers.authorization, `Bearer ${token}`)) return send(res, 401, { error: 'Dashboard link expired or missing its local access token.' });
@@ -52,11 +53,30 @@ export async function createDashboardServer({ host = '127.0.0.1', port = 0, toke
   return { server, host, port: actualPort, token, baseUrl, url: `${baseUrl}#token=${encodeURIComponent(token)}`, close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) };
 }
 
-let activeDashboard;
+let activeDashboard, reopening;
+async function reachable(dashboard) {
+  if (!dashboard?.server.listening) return false;
+  return new Promise((resolve) => {
+    const request = http.get(new URL('/health', dashboard.baseUrl), (response) => {
+      response.resume();
+      resolve(response.statusCode === 204);
+    });
+    request.setTimeout(1000, () => request.destroy());
+    request.on('error', () => resolve(false));
+  });
+}
 export async function openBrowserDashboard() {
-  if (activeDashboard?.server.listening) return { url: activeDashboard.url, host: activeDashboard.host, port: activeDashboard.port };
-  activeDashboard = await createDashboardServer();
-  return { url: activeDashboard.url, host: activeDashboard.host, port: activeDashboard.port };
+  reopening ??= (async () => {
+    let verifiedReachable = await reachable(activeDashboard);
+    if (!verifiedReachable) {
+      await closeBrowserDashboard();
+      activeDashboard = await createDashboardServer();
+      verifiedReachable = await reachable(activeDashboard);
+    }
+    const { url, host, port, baseUrl, server } = activeDashboard;
+    return { url, host, port, baseUrl, listening: server.listening, browserOpened: false, verifiedReachable };
+  })().finally(() => { reopening = undefined; });
+  return reopening;
 }
 export async function closeBrowserDashboard() {
   const current = activeDashboard;
@@ -66,5 +86,6 @@ export async function closeBrowserDashboard() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const dashboard = await openBrowserDashboard();
-  process.stdout.write(`Antigravity Router dashboard: ${dashboard.url}\n`);
+  // Interactive output is the handoff to the operator. Never print the private link to redirected logs.
+  if (process.stdout.isTTY) process.stdout.write(`Open this private dashboard link: ${dashboard.url}\n`);
 }

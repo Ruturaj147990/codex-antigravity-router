@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { delegationDefaults, resolveDelegationOptions } from './index.mjs';
-import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
+import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, describeDenial, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
 
 test('quota failures are classified without treating ordinary failures as exhaustion', () => {
   assert.match(quotaExhaustionReason({ stderr: 'HTTP 429 RESOURCE_EXHAUSTED: quota exceeded' }), /quota exceeded/i);
@@ -72,17 +72,30 @@ test('Antigravity prompt marks every supplied check mandatory and forbids agent 
   assert.match(brief, /do not call terminal, command, notebook, or code-execution tools/i);
   assert.match(brief, /mandatory controller checks \(all run in listed order\)/i);
   assert.doesNotMatch(brief, /choose which listed checks/i);
+  assert.match(brief, /Do not use MCP tools, external lookup/i);
+});
+
+test('permission diagnostics retain structured scope and stage without exposing outside paths', () => {
+  const root = path.resolve('worker');
+  assert.match(describeDenial({ action: 'read_file', path: 'src/types.ts', rule: 'file_scope' }, root), /rule=file_scope; scope=src\/types.ts/);
+  const denied = describeDenial({ action: 'mcp', server: 'docs', tool: 'lookup', phase: 'dispatch',
+    path: path.resolve('secret-project', 'secret.txt'), executed: false }, root);
+  assert.match(denied, /server=docs; tool=lookup.*outside assigned worktree.*phase=dispatch; executed=no/);
+  assert.doesNotMatch(denied, /secret/);
 });
 
 test('verification failures retain stdout, stderr, exit status, timeout and duration for repair', async (t) => {
   const root = fixture(); process.env.CODEX_ANTIGRAVITY_STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'router-diagnostics-'));
   t.after(() => fs.rmSync(process.env.CODEX_ANTIGRAVITY_STATE_ROOT, { recursive: true, force: true }));
-  const diagnosticsProvider = { ...provider, run: async ({ workspace }) => ({ workspace, exitCode: 1, timedOut: false, durationMs: 31, stdoutTail: 'AssertionError: expected digest 1234', stderrTail: 'pytest collection warning' }) };
+  const diagnosticsProvider = { ...provider, run: async ({ workspace }) => ({ workspace, exitCode: 1, timedOut: false, durationMs: 31, stdoutTail: 'verbose output '.repeat(400) + 'AssertionError: expected digest 1234', stderrTail: 'pytest collection warning' }) };
   const task = { id: 'diagnostics', title: 'Preserve diagnostics', risk: 'LOW_RISK', instructions: 'Create a file.', allowedPaths: ['diagnostic.txt'], acceptanceCriteria: ['Check failure remains actionable'], verificationCommands: [['pytest', '-q', 'a long suite path']] };
-  const result = await delegate(root, [task], { workerRunner: async ({ worker }) => { fs.writeFileSync(path.join(worker, 'diagnostic.txt'), 'output'); return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; }, executionProvider: diagnosticsProvider });
+  let repairBrief;
+  const result = await delegate(root, [task], { workerRunner: async ({ worker, retry }) => { if (retry) repairBrief = buildAgentPrompt(worker, task, retry); fs.writeFileSync(path.join(worker, 'diagnostic.txt'), 'output'); return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; }, executionProvider: diagnosticsProvider });
   const check = result.results[0].checks[0];
   assert.equal(check.exitCode, 1); assert.equal(check.durationMs, 31);
   assert.match(check.stdoutTail, /digest 1234/); assert.match(check.stderrTail, /collection warning/);
+  assert.match(repairBrief, /AssertionError: expected digest 1234/);
+  assert.doesNotMatch(repairBrief, /a long suite path/);
 });
 
 test('bounded delegation wait returns a durable batch handle and cursor before work finishes', async (t) => {
@@ -126,14 +139,40 @@ test('independent submissions queue FIFO while an owned worker is active', async
   assert.deepEqual(started, ['first']);
   const duplicateRecovery = await recover(root, second.batchId, true);
   assert.match(duplicateRecovery.warning, /already queued or running/i);
-  releaseFirst();
+  try {
+    const other = await delegate(fixture(), [task('other-repo')], { workerRunner, waitSeconds: 10 });
+    assert.equal(other.results[0].status, 'awaiting_integration');
+    assert.deepEqual(started, ['first', 'other-repo']);
+  } finally {
+    releaseFirst();
+  }
   const first = await firstPromise;
   assert.equal(first.results[0].status, 'awaiting_integration');
   for (let i = 0; i < 50 && !started.includes('second'); i++) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.deepEqual(started, ['first', 'second']);
+  assert.deepEqual(started, ['first', 'other-repo', 'second']);
   let latest = await waitForBatchChange(root, second.batchId, second.cursor, 5);
   for (let i = 0; i < 10 && latest.results[0].status !== 'awaiting_integration'; i++) latest = await waitForBatchChange(root, second.batchId, latest.cursor, 5);
   assert.equal(latest.results[0].status, 'awaiting_integration');
+});
+
+test('failed snapshot before worktree creation remains recoverable with an accurate report', async (t) => {
+  const root = fixture(), stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'router-setup-failure-'));
+  const oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT;
+  process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateDir;
+  t.after(() => { if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState; fs.rmSync(stateDir, { recursive: true, force: true }); });
+  const task = { id: 'badglob', title: 'Failure fixture', risk: 'LOW_RISK', instructions: 'Write a file.', allowedPaths: ['bad/**oops'], acceptanceCriteria: ['File exists'] };
+  let launched = false;
+  const result = await delegate(root, [task], { snapshotFn: async () => { throw new Error('Git ls-files forced setup failure'); }, workerRunner: async () => { launched = true; throw new Error('unexpected launch'); } });
+  assert.equal(result.results[0].status, 'needs_review');
+  assert.equal(result.results[0].workerPathStatus, 'planned_only');
+  assert.equal(result.results[0].workerLaunched, false);
+  assert.equal(result.results[0].retryPossible, true);
+  assert.match(result.results[0].error, /source snapshot.*Git ls-files/);
+  assert.equal(launched, false);
+  const recovered = await recover(root, result.batchId);
+  assert.equal(recovered.results[0].workerPathStatus, 'planned_only');
+  assert.equal(recovered.results[0].retryPossible, true);
+  assert.equal(recovered.results[0].workerLaunched, false);
 });
 
 test('parallel tasks in one batch reuse their immutable source snapshot', async (t) => {
@@ -265,7 +304,7 @@ test('active cancellation preserves partial files and never integrates them', as
   const workerRunner = async ({ worker, cancelFile }) => { workerPath = worker; fs.writeFileSync(path.join(worker, 'partial.txt'), 'unfinished'); signal(); while (!fs.existsSync(cancelFile)) await new Promise((r) => setTimeout(r, 10)); return { code: 1, cancelled: true, result: null, observedCwd: worker, denied: [], tools: [], stderr: 'terminated', briefCharacters: 20 }; };
   const pending = delegate(root, [task], { workerRunner, executionProvider: provider }); await started;
   const reportDir = path.join(process.env.CODEX_ANTIGRAVITY_STATE_ROOT, fs.readdirSync(process.env.CODEX_ANTIGRAVITY_STATE_ROOT).find((x) => x !== 'controller.lock'));
-  const batchId = fs.readdirSync(reportDir)[0];
+  const batchId = fs.readdirSync(reportDir).find((name) => /^[0-9a-f-]{36}$/i.test(name));
   assert.equal(cancelTask(root, batchId, task.id).status, 'cancellation_requested');
   const result = await pending;
   assert.equal(result.results[0].status, 'cancelled'); assert.equal(result.completed, 0);

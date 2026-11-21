@@ -45,3 +45,12 @@ test('trusted-local keeps stdout and stderr separate when a check fails', async 
   assert.equal(result.timedOut, false);
   assert.ok(result.durationMs >= 0);
 });
+
+test('trusted-local preserves a failing check diagnostic written only to stdout', async () => {
+  const provider = new TrustedLocalExecutionProvider();
+  const result = await provider.run({ workspace: process.cwd(), command: [process.execPath, '-e',
+    'console.log("starting checks ".repeat(300)); console.log("IntegrityError: run session does not belong to workspace"); process.exitCode = 1'], timeoutSeconds: 10 });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stderrTail, '');
+  assert.match(result.stdoutTail, /IntegrityError: run session does not belong to workspace/);
+});

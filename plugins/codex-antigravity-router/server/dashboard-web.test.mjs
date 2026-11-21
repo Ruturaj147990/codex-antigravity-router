@@ -50,4 +50,13 @@ test('plugin dashboard entry point returns a temporary loopback browser link', a
   const response = await fetch(link.baseUrl || `http://127.0.0.1:${link.port}/`);
   assert.equal(response.status, 200);
   assert.match(await response.text(), /Antigravity Router/);
+  assert.equal(link.listening, true);
+  assert.equal(link.verifiedReachable, true);
+  assert.equal(link.browserOpened, false);
+  assert.equal((await openBrowserDashboard()).url, link.url);
+  await closeBrowserDashboard();
+  await assert.rejects(fetch(link.baseUrl));
+  const reopened = await openBrowserDashboard();
+  assert.notEqual(reopened.url, link.url);
+  assert.equal(reopened.verifiedReachable, true);
 });
