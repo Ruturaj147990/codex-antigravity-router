@@ -14,7 +14,7 @@
         "shortDescription": "Route tasks to Antigravity",
         "longDescription": "Codex retains architecture and risk decisions while Antigravity investigates, implements, tests, and repairs scoped tasks in isolated worktrees. Users configure their preferred model and worker ceiling; Codex chooses how many independent tasks to run up to that ceiling.",
         "websiteURL": "https://antigravity-task-router.vercel.app",
-        "supportURL": "https://antigravity-task-router.vercel.app/feedback.html",
+        "supportURL": "https://github.com/sponsors/Ruturaj147990",
         "privacyPolicyURL": "https://antigravity-task-router.vercel.app/privacy.html",
         "developerName": "Ruturaj Limbkar"
       }
