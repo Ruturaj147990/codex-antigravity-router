@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { delegationDefaults, resolveDelegationOptions } from './index.mjs';
-import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, describeCliTimeout, describeDenial, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
+import { buildAgentPrompt, buildCliArgs, cancelTask, CLI_PRINT_TIMEOUT, dashboardAgents, delegate, describeCliTimeout, describeDenial, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
 
 test('quota failures are classified without treating ordinary failures as exhaustion', () => {
   assert.match(quotaExhaustionReason({ stderr: 'HTTP 429 RESOURCE_EXHAUSTED: quota exceeded' }), /quota exceeded/i);
@@ -13,17 +13,25 @@ test('quota failures are classified without treating ordinary failures as exhaus
   assert.equal(quotaExhaustionReason({ stderr: 'socket closed unexpectedly' }), null);
 });
 
-test('CLI print timeout reports the shared deadline and non-resumable turn state', () => {
-  const details = describeCliTimeout({ processExited: true, result: { status: 'DEADLINE_EXCEEDED', reason: 'print_timeout', retryable: false } }, 180);
+test('CLI print timeout remains unlimited and task runtime has an independent deadline', () => {
+  assert.equal(CLI_PRINT_TIMEOUT, '0s');
+  const cliArgs = buildCliArgs('C:/router-worker', { id: 'task', title: 'Task', risk: 'LOW_RISK', instructions: 'Do work.', allowedPaths: ['src/a.js'], acceptanceCriteria: ['Done.'], verificationCommands: [] }, 'gemini-3.8-flash-high');
+  assert.equal(cliArgs[cliArgs.indexOf('--print-timeout') + 1], '0s');
+  assert.equal(cliArgs.includes('300s'), false);
+  const details = describeCliTimeout({ processExited: true, result: { status: 'DEADLINE_EXCEEDED', reason: 'print_timeout', retryable: false } }, 0);
   assert.equal(details.source, 'antigravity_print_timeout');
-  assert.equal(details.submissionTimeoutSeconds, 180);
-  assert.equal(details.cliPrintTimeoutSeconds, 180);
-  assert.equal(details.watchdogTerminationAtSeconds, 195);
+  assert.equal(details.maxTaskRuntimeSeconds, null);
+  assert.equal(details.cliPrintTimeoutSeconds, 0);
   assert.equal(details.cliProcessState, 'exited');
   assert.equal(details.remoteTurnState, 'reported_in_progress_by_cli');
   assert.equal(details.resumable, false);
   assert.equal(details.cliRetryable, false);
-  assert.match(details.message, /cannot resume that turn/);
+  assert.match(details.message, /no CLI print deadline/);
+  const taskDeadline = describeCliTimeout({ timedOut: true, processExited: true }, 180);
+  assert.equal(taskDeadline.source, 'router_task_deadline');
+  assert.equal(taskDeadline.maxTaskRuntimeSeconds, 180);
+  assert.equal(taskDeadline.cliPrintTimeoutSeconds, 0);
+  assert.equal(taskDeadline.remoteTurnState, 'unknown_after_task_deadline');
 });
 
 test('dashboard includes recently completed workers with legacy Windows timestamps', (t) => {
@@ -67,6 +75,7 @@ test('installed defaults honor a configurable model and worker ceiling', (t) => 
   assert.equal(defaults.maxWorkers, 6);
   assert.equal(defaults.model, 'gemini-3.8-flash-medium');
   const options = resolveDelegationOptions({ tasks: Array.from({ length: 7 }) }, defaults);
+  assert.equal(options.maxTaskRuntimeSeconds, 0);
   assert.equal(options.maxParallel, 6);
   assert.equal(resolveDelegationOptions({ tasks: [1, 2], maxParallel: 1 }, defaults).maxParallel, 1);
   assert.equal(resolveDelegationOptions({ tasks: [1, 2], executionMode: 'sequential' }, defaults).maxParallel, 1);
@@ -74,6 +83,9 @@ test('installed defaults honor a configurable model and worker ceiling', (t) => 
   assert.throws(() => resolveDelegationOptions({ tasks: Array.from({ length: 7 }), maxParallel: 7 }, defaults), /configured maximum of 6/);
   assert.throws(() => resolveDelegationOptions({ tasks: [1], executionMode: 'parallel-ish' }, defaults), /executionMode must be/);
   assert.throws(() => resolveDelegationOptions({ tasks: [1], runMode: 'untrusted' }, defaults), /runMode must be/);
+  assert.equal(resolveDelegationOptions({ tasks: [1], maxTaskRuntimeSeconds: 600 }, defaults).maxTaskRuntimeSeconds, 600);
+  assert.equal(resolveDelegationOptions({ tasks: [1], timeoutSeconds: 600 }, defaults).maxTaskRuntimeSeconds, 0);
+  assert.equal(resolveDelegationOptions({ tasks: [1], maxTaskRuntimeSeconds: 600, timeoutSeconds: 900 }, defaults).maxTaskRuntimeSeconds, 600);
 });
 
 test('Antigravity prompt marks every supplied check mandatory and forbids agent command tools', () => {
@@ -116,10 +128,24 @@ test('bounded delegation wait returns a durable batch handle and cursor before w
   process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateDir;
   t.after(() => { if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState; fs.rmSync(stateDir, { recursive: true, force: true }); });
   const task = { id: 'slow', title: 'Slow task', risk: 'LOW_RISK', instructions: 'Write a file.', allowedPaths: ['slow.txt'], acceptanceCriteria: ['File exists'] };
-  const submitted = await delegate(root, [task], { waitSeconds: 0, workerRunner: async ({ worker }) => { await new Promise((resolve) => setTimeout(resolve, 100)); fs.writeFileSync(path.join(worker, 'slow.txt'), 'done'); return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; } });
+  let startWorker, releaseWorker;
+  const workerStarted = new Promise((resolve) => { startWorker = resolve; });
+  const workerGate = new Promise((resolve) => { releaseWorker = resolve; });
+  let workerStillRunning = false;
+  const submitted = await delegate(root, [task], { timeoutSeconds: 300, waitSeconds: 0, workerRunner: async ({ worker, maxTaskRuntimeSeconds }) => { assert.equal(maxTaskRuntimeSeconds, 0, 'legacy timeoutSeconds must not become a worker deadline'); workerStillRunning = true; startWorker(); await workerGate; fs.writeFileSync(path.join(worker, 'slow.txt'), 'done'); workerStillRunning = false; return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; } });
   assert.equal(submitted.pending, true); assert.match(submitted.batchId, /^[0-9a-f-]{36}$/); assert.ok(Number.isInteger(submitted.cursor));
-  const changedState = await waitForBatchChange(root, submitted.batchId, submitted.cursor, 5);
-  assert.ok(changedState.cursor > submitted.cursor);
+  assert.equal(submitted.timeoutPolicy.maxTaskRuntimeSeconds, 0);
+  await workerStarted;
+  const pending = await waitForBatchChange(root, submitted.batchId, submitted.cursor, 0);
+  assert.equal(pending.batchId, submitted.batchId);
+  assert.equal(pending.results[0].status, 'running');
+  const unchanged = await waitForBatchChange(root, submitted.batchId, pending.cursor, 0);
+  assert.equal(unchanged.batchId, submitted.batchId);
+  assert.equal(unchanged.waitExpired, true);
+  assert.equal(workerStillRunning, true, 'expiring Codex wait must leave Antigravity worker running');
+  releaseWorker();
+  const changedState = await waitForBatchChange(root, submitted.batchId, pending.cursor, 5);
+  assert.ok(changedState.cursor > pending.cursor);
   let finished = changedState;
   for (let attempt = 0; attempt < 10 && finished.results[0].status !== 'awaiting_integration'; attempt++) finished = await waitForBatchChange(root, submitted.batchId, finished.cursor, 5);
   assert.equal(finished.results[0].status, 'awaiting_integration');
@@ -219,7 +245,7 @@ const provider = {
   run: async ({ workspace, command }) => ({ workspace, exitCode: fs.readFileSync(path.join(workspace, command[0]), 'utf8') === command[1] ? 0 : 1, output: 'fixture assertion' })
 };
 
-test('print timeout details persist in the batch report and recovery view', async (t) => {
+test('print timeout and task deadline details persist in reports and recovery', async (t) => {
   const root = fixture(), stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'router-timeout-state-'));
   const settingsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'router-timeout-settings-'));
   const oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT, oldSettings = process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE;
@@ -231,22 +257,31 @@ test('print timeout details persist in the batch report and recovery view', asyn
     if (oldSettings === undefined) delete process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE; else process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = oldSettings;
     fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(stateRoot, { recursive: true, force: true }); fs.rmSync(settingsRoot, { recursive: true, force: true });
   });
-  const tasks = [{ id: 'print_timeout', title: 'Create a verifier', risk: 'LOW_RISK', instructions: 'Create the requested script.', allowedPaths: ['scripts/verify.py'], acceptanceCriteria: ['The verifier exists.'] }];
+  const tasks = [
+    { id: 'print_timeout', title: 'Create a verifier', risk: 'LOW_RISK', instructions: 'Create the requested script.', allowedPaths: ['scripts/verify.py'], acceptanceCriteria: ['The verifier exists.'] },
+    { id: 'task_deadline', title: 'Create another verifier', risk: 'LOW_RISK', instructions: 'Create the requested script.', allowedPaths: ['scripts/other.py'], acceptanceCriteria: ['The verifier exists.'] }
+  ];
   const result = await delegate(root, tasks, {
-    timeoutSeconds: 180, maxParallel: 1,
-    workerRunner: async () => ({ code: 0, timedOut: false, processExited: true, result: { status: 'DEADLINE_EXCEEDED', reason: 'print_timeout', retryable: false }, observedCwd: null, denied: [], tools: [], stderr: '', briefCharacters: 80, durationMs: 180000 })
+    maxTaskRuntimeSeconds: 180, maxParallel: 1,
+    workerRunner: async ({ task }) => task.id === 'print_timeout'
+      ? ({ code: 0, timedOut: false, processExited: true, result: { status: 'DEADLINE_EXCEEDED', reason: 'print_timeout', retryable: false }, observedCwd: null, denied: [], tools: [], stderr: '', briefCharacters: 80, durationMs: 180000 })
+      : ({ code: null, timedOut: true, processExited: true, result: null, observedCwd: null, denied: [], tools: [], stderr: '', briefCharacters: 80, durationMs: 180000 })
   });
-  assert.equal(result.timeoutPolicy.submissionTimeoutSeconds, 180);
-  assert.equal(result.timeoutPolicy.cliPrintTimeoutSeconds, 180);
-  assert.equal(result.timeoutPolicy.controllerTerminatesAtSeconds, 195);
+  assert.equal(result.timeoutPolicy.maxTaskRuntimeSeconds, 180);
+  assert.equal(result.timeoutPolicy.cliPrintTimeoutSeconds, 0);
+  assert.equal(result.timeoutPolicy.deadlineEnabled, true);
   assert.equal(result.results[0].status, 'needs_review');
   assert.equal(result.results[0].timeoutDetails.cliProcessState, 'exited');
   assert.equal(result.results[0].timeoutDetails.remoteTurnState, 'reported_in_progress_by_cli');
   assert.equal(result.results[0].turnResumable, false);
   assert.equal(result.results[0].timeoutDetails.cliRetryable, false);
   assert.equal(result.results[0].workerPathStatus, 'exists');
+  assert.equal(result.results[1].timeoutDetails.source, 'router_task_deadline');
+  assert.equal(result.results[1].timeoutDetails.maxTaskRuntimeSeconds, 180);
+  assert.equal(result.results[1].timeoutDetails.cliPrintTimeoutSeconds, 0);
   const recovered = await recover(root, result.batchId);
   assert.equal(recovered.results[0].timeoutDetails.resumable, false);
+  assert.equal(recovered.results[1].timeoutDetails.source, 'router_task_deadline');
   assert.equal(recovered.results[0].status, 'needs_review');
 });
 

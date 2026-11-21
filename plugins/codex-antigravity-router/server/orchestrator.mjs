@@ -10,7 +10,14 @@ import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserS
 
 const exec = promisify(execFile);
 const CLI = process.env.CODEX_ANTIGRAVITY_CLI || path.join(os.homedir(), '.gemini', 'bin', process.platform === 'win32' ? 'agy.exe' : 'agy');
-const CLI_WATCHDOG_GRACE_SECONDS = 15;
+export const MAX_TASK_RUNTIME_SECONDS = Math.floor(2_147_483_647 / 1000);
+export const CLI_PRINT_TIMEOUT = '0s';
+const VERIFICATION_TIMEOUT_SECONDS = 300;
+export function buildCliArgs(worker, task, model, retry = '') {
+  const settings = JSON.stringify({ permissions: { allow: [`read_file(${worker})`, `write_file(${worker})`] } });
+  const brief = buildAgentPrompt(worker, task, retry);
+  return ['--sandbox', '--settings', settings, '--output-format', 'stream-json', '--mode', 'accept-edits', '--model', model, '--print-timeout', CLI_PRINT_TIMEOUT, '--print', brief];
+}
 const now = () => new Date().toISOString();
 const alive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 const normalize = (p) => key(path.resolve(p));
@@ -178,12 +185,11 @@ export function buildAgentPrompt(worker, t, retry = '') {
     retry ? `Independent verification failed: ${retry}. Diagnose and repair within the same worktree, then report the result.` : ''
   ].filter(Boolean).join('\n');
 }
-function runCli(worker, t, model, timeout, retry, onPid, cancelFile, snap, save) {
+function runCli(worker, t, model, maxTaskRuntimeSeconds, retry, onPid, cancelFile, snap, save) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const settings = JSON.stringify({ permissions: { allow: [`read_file(${worker})`, `write_file(${worker})`] } });
     const brief = buildAgentPrompt(worker, t, retry);
-    const args = ['--sandbox', '--settings', settings, '--output-format', 'stream-json', '--mode', 'accept-edits', '--model', model, '--print-timeout', `${timeout}s`, '--print', brief];
+    const args = buildCliArgs(worker, t, model, retry);
     const child = spawn(CLI, args, { cwd: worker, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     onPid(child.pid);
     let buffer = '', stderr = '', result = null, observedCwd = null, denied = [], tools = [], timedOut = false, cancelled = false, noProgress = false, closed = false;
@@ -191,10 +197,10 @@ function runCli(worker, t, model, timeout, retry, onPid, cancelFile, snap, save)
       if (process.platform === 'win32' && child.pid) exec('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true }).catch(() => child.kill());
       else child.kill();
     };
-    const timer = setTimeout(() => { timedOut = true; terminate(); }, (timeout + CLI_WATCHDOG_GRACE_SECONDS) * 1000);
+    const timer = maxTaskRuntimeSeconds > 0 ? setTimeout(() => { timedOut = true; terminate(); }, maxTaskRuntimeSeconds * 1000) : null;
     const cancellation = setInterval(() => { if (fs.existsSync(cancelFile) && !cancelled) { cancelled = true; terminate(); } }, 250);
     const budget = Number(process.env.CODEX_ANTIGRAVITY_NO_EDIT_SECONDS || 0);
-    const progressTimer = Number.isSafeInteger(budget) && budget > 0 && budget < timeout ? setTimeout(async () => {
+    const progressTimer = Number.isSafeInteger(budget) && budget > 0 && (!maxTaskRuntimeSeconds || budget < maxTaskRuntimeSeconds) ? setTimeout(async () => {
       // Only stop when the worktree can be inspected and still has no edits.
       const edits = await changed(worker, snap).catch(() => null);
       if (!closed && !cancelled && edits?.length === 0) { noProgress = true; terminate(); }
@@ -204,6 +210,8 @@ function runCli(worker, t, model, timeout, retry, onPid, cancelFile, snap, save)
       let event;
       try { event = JSON.parse(s); } catch { return; }
       if (event.event === 'init') observedCwd = event.init?.cwd || null;
+      const conversationId = event.conversation_id || event.step_update?.conversation_id || event.result?.conversation_id;
+      if (typeof conversationId === 'string' && conversationId) t.conversationId = conversationId;
       if (event.event === 'result') { result = event.result; denied = result?.denied_actions || []; }
       const step = event.step_update;
       const name = step?.tool_info?.name;
@@ -248,27 +256,25 @@ export function quotaExhaustionReason(run) {
   if (/\b(resource_exhausted|quota[_ -]?(?:exceeded|exhausted|limit)|rate[_ -]?limit(?:ed)?|too many requests|weekly quota|usage limit reached|model quota)\b|\b429\b/i.test(text)) return text.replace(/\s+/g, ' ').slice(0, 700) || 'Antigravity reported a quota limit.';
   return null;
 }
-export function describeCliTimeout(run, timeoutSeconds) {
+export function describeCliTimeout(run, maxTaskRuntimeSeconds = 0) {
   const resultText = JSON.stringify(run?.result || {});
   const printTimedOut = /print[_ -]?timeout/i.test(resultText) || run?.result?.status === 'DEADLINE_EXCEEDED';
   if (!run?.timedOut && !printTimedOut) return null;
-  const source = printTimedOut ? 'antigravity_print_timeout' : 'router_process_watchdog';
-  const remoteTurnState = printTimedOut ? 'reported_in_progress_by_cli' : 'unknown_after_watchdog_termination';
+  const source = printTimedOut ? 'antigravity_print_timeout' : 'router_task_deadline';
+  const remoteTurnState = printTimedOut ? 'reported_in_progress_by_cli' : 'unknown_after_task_deadline';
   const processState = run.processExited === true ? 'exited' : run.timedOut ? 'termination_requested' : 'unknown';
   const resultRetryable = typeof run.result?.retryable === 'boolean' ? run.result.retryable : null;
   return {
     source,
-    submissionTimeoutSeconds: timeoutSeconds,
-    cliPrintTimeoutSeconds: timeoutSeconds,
-    watchdogGraceSeconds: CLI_WATCHDOG_GRACE_SECONDS,
-    watchdogTerminationAtSeconds: timeoutSeconds + CLI_WATCHDOG_GRACE_SECONDS,
+    maxTaskRuntimeSeconds: maxTaskRuntimeSeconds || null,
+    cliPrintTimeoutSeconds: 0,
     cliProcessState: processState,
     remoteTurnState,
     resumable: false,
     cliRetryable: resultRetryable,
     message: printTimedOut
-      ? `Antigravity's print timeout is the submission timeout (${timeoutSeconds}s). Its CLI process ${processState}; the CLI reported that the turn was still in progress. This router cannot resume that turn. The worker worktree is preserved for inspection; start a new task only after reviewing it.`
-      : `The router watchdog terminated the Antigravity CLI after ${timeoutSeconds + CLI_WATCHDOG_GRACE_SECONDS}s (${timeoutSeconds}s print timeout plus ${CLI_WATCHDOG_GRACE_SECONDS}s grace). The worker worktree is preserved; this router cannot resume the CLI turn.`
+      ? `Antigravity returned print_timeout even though the router requests no CLI print deadline (0s means wait until completion). Its CLI process ${processState}; remote turn liveness is not independently known. The router cannot reattach to this invocation; the worker worktree is preserved for inspection.`
+      : `The router stopped the worker at its configured maximum runtime of ${maxTaskRuntimeSeconds}s. The CLI process ${processState}; remote turn liveness is not independently known. The worker worktree is preserved for inspection.`,
   };
 }
 export function dashboardAgents() {
@@ -324,18 +330,18 @@ function stopBatchForQuota(folder, state, currentTask, reason, save) {
   currentTask.error = `Antigravity quota limit detected; delegation was ${preferenceWriteError ? 'disabled for this batch, but could not be saved in settings' : 'turned off'}. ${reason}`;
   save();
 }
-async function verify(worker, t, timeout, provider) {
+async function verify(worker, t, provider) {
   const checks = [];
   for (const command of t.verificationCommands) {
     try {
-      const result = await provider.run({ taskId: t.id, workspace: worker, command, timeoutSeconds: Math.min(timeout, 300) });
+      const result = await provider.run({ taskId: t.id, workspace: worker, command, timeoutSeconds: VERIFICATION_TIMEOUT_SECONDS });
       if (result?.workspace !== worker || !Number.isInteger(result?.exitCode)) throw new Error('Restricted runner returned an invalid workspace or exit status.');
       checks.push({ command, label: `${command[0]} (${command.length - 1} args)`, passed: result.exitCode === 0, exitCode: result.exitCode, timedOut: result.timedOut === true, durationMs: Number.isFinite(result.durationMs) ? result.durationMs : null, stdoutTail: String(result.stdoutTail ?? result.output ?? '').slice(-2000), stderrTail: String(result.stderrTail || '').slice(-2000) });
     } catch (e) { checks.push({ command, label: `${command[0]} (${command.length - 1} args)`, passed: false, exitCode: null, timedOut: false, durationMs: null, stdoutTail: '', stderrTail: String(e.message || e).slice(-2000) }); }
   }
   return checks;
 }
-async function execute(root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot) {
+async function execute(root, folder, state, t, model, maxTaskRuntimeSeconds, save, provider, workerRunner, getSnapshot) {
   t.status = 'preparing'; t.setupPhase = 'workspace planning'; t.workerLaunched = false; save();
   const cancelFile = path.join(folder, `${t.id}.cancel`);
   const worker = await managedCheckout(root, state.batchId, state.tasks.indexOf(t));
@@ -357,14 +363,14 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     const attemptStartedAt = Date.now();
     delete t.liveTokens;
     const trackPid = (pid) => { if (pid) { activeWorkerPids.add(pid); t.workerLaunched = true; } t.pid = pid; save(); };
-    try { run = await (workerRunner ? workerRunner({ worker, task: t, model, timeout, retry, onPid: trackPid, cancelFile }) : runCli(worker, t, model, timeout, retry, trackPid, cancelFile, snap, save)); }
+    try { run = await (workerRunner ? workerRunner({ worker, task: t, model, maxTaskRuntimeSeconds, retry, onPid: trackPid, cancelFile }) : runCli(worker, t, model, maxTaskRuntimeSeconds, retry, trackPid, cancelFile, snap, save)); }
     finally { if (t.pid) activeWorkerPids.delete(t.pid); }
     t.briefCharacters = (t.briefCharacters || 0) + run.briefCharacters;
     t.workerDurationMs = (t.workerDurationMs || 0) + (Number.isFinite(run.durationMs) ? run.durationMs : Date.now() - attemptStartedAt);
     t.toolEvents = (t.toolEvents || 0) + (Array.isArray(run.tools) ? run.tools.length : 0);
     t.antigravityTokens = (t.antigravityTokens || 0) + (run.result?.usage?.total_tokens || 0);
     t.pid = null; t.conversationId = run.result?.conversation_id || t.conversationId; save();
-    const timeoutDetails = describeCliTimeout(run, timeout);
+    const timeoutDetails = describeCliTimeout(run, maxTaskRuntimeSeconds);
     if (timeoutDetails) t.timeoutDetails = timeoutDetails;
     if (run.cancelled || fs.existsSync(cancelFile)) { t.status = 'cancelled'; break; }
     const rawReply = String(run.result?.response || '');
@@ -393,7 +399,7 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     if (/^\s*ESCALATE_RISK:/i.test(reply)) { t.status = 'needs_review'; t.error = 'Worker escalated risk or scope'; break; }
     if (!edits.length && !reply.trim()) { t.status = 'needs_review'; t.error = 'CLI returned empty result and no edits'; break; }
     const beforeChecks = Object.fromEntries(edits.map((p) => [p, hash(safeFile(worker, p))]));
-    checks = await verify(worker, t, timeout, provider);
+    checks = await verify(worker, t, provider);
     const failed = checks.filter((c) => !c.passed);
     if (!failed.length) {
       if (edits.some((p) => hash(safeFile(worker, p)) !== beforeChecks[p])) { t.status = 'needs_review'; t.error = 'Verification command modified worker output.'; break; }
@@ -416,8 +422,9 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
   else { t.status = 'completed'; state.invalidateSnapshot?.(); }
   save();
 }
-function report(state) { return { timeoutPolicy: { submissionTimeoutSeconds: state.timeout ?? null, cliPrintTimeoutSeconds: state.timeout ?? null, controllerWatchdogGraceSeconds: CLI_WATCHDOG_GRACE_SECONDS, controllerTerminatesAtSeconds: Number.isInteger(state.timeout) ? state.timeout + CLI_WATCHDOG_GRACE_SECONDS : null, description: 'timeoutSeconds is passed directly to Antigravity --print-timeout; the router watchdog terminates the local CLI process 15 seconds later if it remains open.' }, batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, setupPhase: t.setupPhase || null, workerLaunched: t.workerLaunched === true, workerPathStatus: t.worker ? (fs.existsSync(t.worker) ? 'exists' : 'planned_only') : 'unavailable', retryPossible: t.status === 'needs_review' && !t.workerLaunched && (!t.worker || !fs.existsSync(t.worker)), noProgress: t.noProgress || undefined, lastFileTool: t.lastFileTool, lastFileActivityAt: t.lastFileActivityAt, antigravityTokens: t.antigravityTokens || t.liveTokens || undefined, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, timeoutDetails: t.timeoutDetails || null, turnResumable: t.timeoutDetails ? t.timeoutDetails.resumable : null, conversationIdAvailable: Boolean(t.conversationId), changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
-async function schedule(state, folder, model, timeout, provider, workerRunner, snapshotFn = snapshot) {
+function configuredTaskRuntime(state) { return state.maxTaskRuntimeSeconds ?? 0; }
+function report(state) { const maxTaskRuntimeSeconds = configuredTaskRuntime(state); return { timeoutPolicy: { maxTaskRuntimeSeconds, deadlineEnabled: maxTaskRuntimeSeconds > 0, cliPrintTimeoutSeconds: 0, description: 'Antigravity --print-timeout is unlimited (0s). Codex waitSeconds is independent; maxTaskRuntimeSeconds is an optional controller-enforced deadline.' }, batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, setupPhase: t.setupPhase || null, workerLaunched: t.workerLaunched === true, workerPathStatus: t.worker ? (fs.existsSync(t.worker) ? 'exists' : 'planned_only') : 'unavailable', retryPossible: t.status === 'needs_review' && !t.workerLaunched && (!t.worker || !fs.existsSync(t.worker)), noProgress: t.noProgress || undefined, lastFileTool: t.lastFileTool, lastFileActivityAt: t.lastFileActivityAt, antigravityTokens: t.antigravityTokens || t.liveTokens || undefined, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, timeoutDetails: t.timeoutDetails || null, turnResumable: t.timeoutDetails ? t.timeoutDetails.resumable : null, conversationIdAvailable: Boolean(t.conversationId), changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
+async function schedule(state, folder, model, maxTaskRuntimeSeconds, provider, workerRunner, snapshotFn = snapshot) {
   const taskVersions = new Map();
   const save = () => {
     state.revision = (state.revision || 0) + 1;
@@ -477,7 +484,7 @@ async function schedule(state, folder, model, timeout, provider, workerRunner, s
       if (state.tasks.slice(0, index).some((x) => ['awaiting_integration', 'conflict', 'needs_review'].includes(x.status) && overlaps(x, t))) continue;
       if ([...running].some((x) => overlaps(x, t))) continue;
       if (!claimSlot(state, t, save)) { waitingForSlot = true; break; }
-      const job = withGitLogs(folder, () => execute(state.root, folder, state, t, model, timeout, save, provider, workerRunner, getSnapshot)).catch((e) => { t.status = 'needs_review'; t.error = `Setup/worker phase ${t.setupPhase || 'scheduling'}: ${e.message}`; t.finishedAt = now(); save(); }).finally(() => {
+      const job = withGitLogs(folder, () => execute(state.root, folder, state, t, model, maxTaskRuntimeSeconds, save, provider, workerRunner, getSnapshot)).catch((e) => { t.status = 'needs_review'; t.error = `Setup/worker phase ${t.setupPhase || 'scheduling'}: ${e.message}`; t.finishedAt = now(); save(); }).finally(() => {
         t.slotHeld = false;
         running.delete(t);
         save();
@@ -500,9 +507,11 @@ export async function delegate(root, rawTasks, options = {}) {
   if (!settings.enabled) throw new Error('Antigravity delegation is disabled. Turn it on in the router panel or settings before delegating.');
   const tasks = validate(rawTasks);
   const model = options.model === undefined ? settings.model : validatePreferredModel(options.model, 'model');
-  const timeout = options.timeoutSeconds ?? 1200;
+  // Older callers used timeoutSeconds as a CLI print/wait timeout. Never
+  // reinterpret that legacy field as permission to terminate a task.
+  const maxTaskRuntimeSeconds = options.maxTaskRuntimeSeconds ?? 0;
   const waitSeconds = options.waitSeconds ?? 20;
-  if (!Number.isSafeInteger(timeout) || timeout < 60 || timeout > 3600) throw new Error('timeoutSeconds must be an integer from 60 to 3600.');
+  if (!Number.isSafeInteger(maxTaskRuntimeSeconds) || maxTaskRuntimeSeconds < 0 || maxTaskRuntimeSeconds > MAX_TASK_RUNTIME_SECONDS) throw new Error(`maxTaskRuntimeSeconds must be 0 (unlimited) or an integer from 1 to ${MAX_TASK_RUNTIME_SECONDS}.`);
   if (!Number.isSafeInteger(waitSeconds) || waitSeconds < 0 || waitSeconds > 30) throw new Error('waitSeconds must be an integer from 0 to 30.');
   if (options.executionMode !== undefined && !['sequential', 'parallel'].includes(options.executionMode)) throw new Error('executionMode must be sequential or parallel.');
   if (options.runMode !== undefined && !['fail-closed', 'trusted-local'].includes(options.runMode)) throw new Error('runMode must be fail-closed or trusted-local.');
@@ -529,10 +538,10 @@ export async function delegate(root, rawTasks, options = {}) {
     const batchId = crypto.randomUUID(), folder = path.join(base, batchId);
     fs.mkdirSync(folder, { recursive: true });
     await managedCheckout(root, batchId, 0);
-    const state = { version: 1, batchId, root: canonical(root), model, timeout, runMode, maxWorkers: settings.maxWorkers, maxParallel, revision: 0, controllerPid: process.pid, batchStatus: 'queued', createdAt: now(), tasks };
+    const state = { version: 1, batchId, root: canonical(root), model, maxTaskRuntimeSeconds, runMode, maxWorkers: settings.maxWorkers, maxParallel, revision: 0, controllerPid: process.pid, batchStatus: 'queued', createdAt: now(), tasks };
     state.stateFile = path.join(folder, 'state.json'); persist(state.stateFile, state);
     release(); lockHeld = false;
-    const queued = enqueueBatch(root, batchId, () => schedule(state, folder, model, timeout, provider, options.workerRunner, options.snapshotFn));
+    const queued = enqueueBatch(root, batchId, () => schedule(state, folder, model, maxTaskRuntimeSeconds, provider, options.workerRunner, options.snapshotFn));
     const completion = queued.completion.catch((error) => { state.controllerError = String(error.message || error).slice(0, 500); state.finishedAt = now(); state.batchStatus = 'failed'; persist(state.stateFile, state); return report(state); });
     if (waitSeconds === 0) return { ...report(state), pending: true, queuePosition: queued.position };
     let timer;
@@ -588,7 +597,7 @@ export async function recover(root, batchId, resume = false, executionProvider =
     if (state.tasks.some((t) => t.status === 'queued' && t.verificationCommands?.length)) await requireAuthorizedProvider(provider, state.runMode || 'fail-closed');
     state.batchStatus = 'queued'; state.controllerPid = process.pid; delete state.finishedAt; persist(file, state);
     release(); lockHeld = false;
-    const queued = enqueueBatch(root, batchId, () => schedule(state, folder, state.model, state.timeout, provider));
+    const queued = enqueueBatch(root, batchId, () => schedule(state, folder, state.model, configuredTaskRuntime(state), provider));
     return await queued.completion;
   } finally { if (lockHeld) release(); }
 }
@@ -619,7 +628,7 @@ export async function integrateTask(root, batchId, taskId, executionProvider = n
       if (state.tasks.some((item) => item.status === 'queued' && item.verificationCommands?.length)) await requireAuthorizedProvider(provider, state.runMode || 'fail-closed');
       state.batchStatus = 'queued'; state.controllerPid = process.pid; delete state.finishedAt; persist(file, state);
       release(); lockHeld = false;
-      const queued = enqueueBatch(root, batchId, () => schedule(state, path.dirname(file), state.model, state.timeout, provider));
+      const queued = enqueueBatch(root, batchId, () => schedule(state, path.dirname(file), state.model, configuredTaskRuntime(state), provider));
       return await queued.completion;
     }
     return report(state);

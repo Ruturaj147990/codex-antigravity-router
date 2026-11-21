@@ -6,6 +6,7 @@ import { availableModels, cancelTask, dashboardAgents, delegate, disposeTask, in
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
 import { openBrowserDashboard } from './dashboard-web.mjs';
 import { verificationReadiness } from './execution-provider.mjs';
+import { MAX_TASK_RUNTIME_SECONDS } from './orchestrator.mjs';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const DASHBOARD_URI = 'ui://antigravity-router/dashboard-v0.7.1.html';
@@ -16,6 +17,10 @@ export function delegationDefaults(env = process.env) {
   return { runMode, model: settings.model, maxWorkers: settings.maxWorkers, maxParallel: settings.maxWorkers, settingsFile: settings.settingsFile };
 }
 export function resolveDelegationOptions(args, defaults = delegationDefaults()) {
+  // timeoutSeconds was the old CLI print timeout; ignore it so stale clients
+  // cannot accidentally impose a runtime deadline on a worker.
+  const maxTaskRuntimeSeconds = args.maxTaskRuntimeSeconds ?? 0;
+  if (!Number.isSafeInteger(maxTaskRuntimeSeconds) || maxTaskRuntimeSeconds < 0 || maxTaskRuntimeSeconds > MAX_TASK_RUNTIME_SECONDS) throw new Error(`maxTaskRuntimeSeconds must be 0 (unlimited) or an integer from 1 to ${MAX_TASK_RUNTIME_SECONDS}.`);
   if (args.executionMode !== undefined && !['sequential', 'parallel'].includes(args.executionMode)) {
     throw new Error('executionMode must be sequential or parallel.');
   }
@@ -31,7 +36,7 @@ export function resolveDelegationOptions(args, defaults = delegationDefaults()) 
   const maxParallel = args.executionMode === 'sequential' ? 1 : args.maxParallel ?? Math.min(defaults.maxWorkers, args.tasks?.length || 1);
   // The dashboard preference is authoritative. Task payloads cannot silently
   // substitute a different provider/model; users change it in the dashboard.
-  return { ...args, model: defaults.model, runMode: args.runMode ?? defaults.runMode, maxParallel };
+  return { ...args, maxTaskRuntimeSeconds, model: defaults.model, runMode: args.runMode ?? defaults.runMode, maxParallel };
 }
 const task = { type: 'object', properties: {
   id: { type: 'string', description: 'Unique batch-local identifier: letters, digits, underscore or hyphen.' },
@@ -51,8 +56,8 @@ const tools = [
   { name: 'antigravity_dashboard_data', description: 'Read router settings, concise current worker state, and controller-managed verification readiness before submitting work.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'antigravity_update_settings', description: 'Save delegation enabled state, model preference, and worker ceiling from the router dashboard.', inputSchema: { type: 'object', properties: { enabled: { type: 'boolean' }, maxWorkers: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, model: { type: 'string' } }, required: ['enabled', 'maxWorkers', 'model'], additionalProperties: false } },
   { name: 'antigravity_status', description: 'Check the local CLI, model, Git workspace, and verification readiness. `ready` covers CLI/Git; inspect `verificationReady` before submitting tasks with checks.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, model: { type: 'string' } }, required: ['workspaceRoot'], additionalProperties: false } },
-  { name: 'delegate_antigravity_tasks', description: 'Submit up to the user-configured Antigravity worker limit (1–32). Codex chooses a lower maxParallel for dependent or overlapping work. The controller runs every supplied verification check in order. Trusted-local commands use normal Windows user permissions when configured.', inputSchema: { type: 'object', properties: {
-    workspaceRoot: { type: 'string' }, model: { type: 'string' }, runMode: { type: 'string', enum: ['fail-closed', 'trusted-local'] }, executionMode: { type: 'string', enum: ['sequential', 'parallel'] }, maxParallel: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, timeoutSeconds: { type: 'integer', minimum: 60, maximum: 3600, description: 'Submission timeout in seconds; passed directly to Antigravity --print-timeout. A router watchdog may terminate the local CLI process 15 seconds later.' }, waitSeconds: { type: 'integer', minimum: 0, maximum: 30, description: 'Maximum time to wait for this response; the durable batch ID is returned even if work continues.' },
+  { name: 'delegate_antigravity_tasks', description: 'Submit up to the user-configured Antigravity worker limit (1–32). Codex waitSeconds only bounds how long this call waits for an update. Antigravity CLI print timeout is disabled; optional maxTaskRuntimeSeconds (0/unset = unlimited) is a separate router-enforced worker deadline. Codex can poll the same batch ID every 30 seconds. Every supplied verification check runs in order.', inputSchema: { type: 'object', properties: {
+    workspaceRoot: { type: 'string' }, model: { type: 'string' }, runMode: { type: 'string', enum: ['fail-closed', 'trusted-local'] }, executionMode: { type: 'string', enum: ['sequential', 'parallel'] }, maxParallel: { type: 'integer', minimum: 1, maximum: MAX_WORKERS_LIMIT }, maxTaskRuntimeSeconds: { type: 'integer', minimum: 0, maximum: MAX_TASK_RUNTIME_SECONDS, description: 'Optional maximum worker runtime explicitly chosen by the caller. 0 or omitted means unlimited. Independent of Codex waitSeconds and CLI print timeout.' }, timeoutSeconds: { type: 'integer', minimum: 0, maximum: MAX_TASK_RUNTIME_SECONDS, description: 'Deprecated compatibility field from older clients; ignored. Use waitSeconds to bound Codex waiting, or maxTaskRuntimeSeconds only when an explicit worker deadline is required.' }, waitSeconds: { type: 'integer', minimum: 0, maximum: 30, description: 'How long Codex waits in this call; expiry returns the same durable batch ID and does not stop Antigravity.' },
     tasks: { type: 'array', minItems: 1, maxItems: 32, items: task }
   }, required: ['workspaceRoot', 'tasks'], additionalProperties: false } },
   { name: 'antigravity_recover', description: 'Inspect a preserved batch; optionally mark interrupted work for review and resume queued tasks without rerunning uncertain work.', inputSchema: { type: 'object', properties: {
@@ -82,7 +87,6 @@ async function call(name, args) {
   if (typeof args.workspaceRoot !== 'string' || !path.isAbsolute(args.workspaceRoot)) throw new Error('workspaceRoot must be absolute.');
   if (name === 'antigravity_status') return result(await status(args.workspaceRoot, args.model));
   if (name === 'delegate_antigravity_tasks') {
-    if (args.timeoutSeconds !== undefined && (!Number.isInteger(args.timeoutSeconds) || args.timeoutSeconds < 60 || args.timeoutSeconds > 3600)) throw new Error('timeoutSeconds must be 60–3600.');
     const defaults = delegationDefaults();
     const options = resolveDelegationOptions({ waitSeconds: 0, ...args }, defaults);
     const out = await delegate(args.workspaceRoot, args.tasks, options);
@@ -104,7 +108,7 @@ async function handle(message) {
   try {
     let value;
     switch (message.method) {
-      case 'initialize': value = { protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION, capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'codex-antigravity-router', version: '1.0.5' } }; break;
+      case 'initialize': value = { protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION, capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'codex-antigravity-router', version: '1.0.7' } }; break;
       case 'ping': value = {}; break;
       case 'tools/list': value = { tools }; break;
       case 'resources/list': value = { resources: [{ uri: DASHBOARD_URI, name: 'Antigravity Router Dashboard', mimeType: 'text/html;profile=mcp-app' }] }; break;

@@ -29,7 +29,7 @@ if (process.env.CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE !== 'trusted-local') {
   throw new Error('Set CODEX_ANTIGRAVITY_DEFAULT_RUN_MODE=trusted-local explicitly to run the real integration smoke test.');
 }
 console.log(JSON.stringify({ root, stateRoot: process.env.CODEX_ANTIGRAVITY_STATE_ROOT, count, preferredModel: settings.model, maxWorkers: settings.maxWorkers }));
-const report = await delegate(root, tasks, { maxParallel: Math.min(settings.maxWorkers, count), timeoutSeconds: 300, runMode: 'trusted-local' });
+const report = await delegate(root, tasks, { maxParallel: Math.min(settings.maxWorkers, count), runMode: 'trusted-local' });
 console.log(JSON.stringify(report));
 if (process.argv[3] === 'high') {
   console.log(JSON.stringify({ beforeIntegration: fs.existsSync(path.join(root, 'result-1.txt')) }));
