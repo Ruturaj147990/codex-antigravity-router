@@ -5,12 +5,25 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { delegationDefaults, resolveDelegationOptions } from './index.mjs';
-import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, describeDenial, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
+import { buildAgentPrompt, cancelTask, dashboardAgents, delegate, describeCliTimeout, describeDenial, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
 
 test('quota failures are classified without treating ordinary failures as exhaustion', () => {
   assert.match(quotaExhaustionReason({ stderr: 'HTTP 429 RESOURCE_EXHAUSTED: quota exceeded' }), /quota exceeded/i);
   assert.match(quotaExhaustionReason({ result: { response: 'Weekly quota limit reached' } }), /weekly quota/i);
   assert.equal(quotaExhaustionReason({ stderr: 'socket closed unexpectedly' }), null);
+});
+
+test('CLI print timeout reports the shared deadline and non-resumable turn state', () => {
+  const details = describeCliTimeout({ processExited: true, result: { status: 'DEADLINE_EXCEEDED', reason: 'print_timeout', retryable: false } }, 180);
+  assert.equal(details.source, 'antigravity_print_timeout');
+  assert.equal(details.submissionTimeoutSeconds, 180);
+  assert.equal(details.cliPrintTimeoutSeconds, 180);
+  assert.equal(details.watchdogTerminationAtSeconds, 195);
+  assert.equal(details.cliProcessState, 'exited');
+  assert.equal(details.remoteTurnState, 'reported_in_progress_by_cli');
+  assert.equal(details.resumable, false);
+  assert.equal(details.cliRetryable, false);
+  assert.match(details.message, /cannot resume that turn/);
 });
 
 test('dashboard includes recently completed workers with legacy Windows timestamps', (t) => {
@@ -205,6 +218,37 @@ const provider = {
   capabilities: async () => ({ isolated: true, workspaceBound: true, capturesExitStatus: true }),
   run: async ({ workspace, command }) => ({ workspace, exitCode: fs.readFileSync(path.join(workspace, command[0]), 'utf8') === command[1] ? 0 : 1, output: 'fixture assertion' })
 };
+
+test('print timeout details persist in the batch report and recovery view', async (t) => {
+  const root = fixture(), stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'router-timeout-state-'));
+  const settingsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'router-timeout-settings-'));
+  const oldState = process.env.CODEX_ANTIGRAVITY_STATE_ROOT, oldSettings = process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE;
+  process.env.CODEX_ANTIGRAVITY_STATE_ROOT = stateRoot;
+  process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = path.join(settingsRoot, 'settings.json');
+  fs.writeFileSync(process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE, JSON.stringify({ enabled: true, maxWorkers: 4, model: 'gemini-3.8-flash-low' }));
+  t.after(() => {
+    if (oldState === undefined) delete process.env.CODEX_ANTIGRAVITY_STATE_ROOT; else process.env.CODEX_ANTIGRAVITY_STATE_ROOT = oldState;
+    if (oldSettings === undefined) delete process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE; else process.env.CODEX_ANTIGRAVITY_SETTINGS_FILE = oldSettings;
+    fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(stateRoot, { recursive: true, force: true }); fs.rmSync(settingsRoot, { recursive: true, force: true });
+  });
+  const tasks = [{ id: 'print_timeout', title: 'Create a verifier', risk: 'LOW_RISK', instructions: 'Create the requested script.', allowedPaths: ['scripts/verify.py'], acceptanceCriteria: ['The verifier exists.'] }];
+  const result = await delegate(root, tasks, {
+    timeoutSeconds: 180, maxParallel: 1,
+    workerRunner: async () => ({ code: 0, timedOut: false, processExited: true, result: { status: 'DEADLINE_EXCEEDED', reason: 'print_timeout', retryable: false }, observedCwd: null, denied: [], tools: [], stderr: '', briefCharacters: 80, durationMs: 180000 })
+  });
+  assert.equal(result.timeoutPolicy.submissionTimeoutSeconds, 180);
+  assert.equal(result.timeoutPolicy.cliPrintTimeoutSeconds, 180);
+  assert.equal(result.timeoutPolicy.controllerTerminatesAtSeconds, 195);
+  assert.equal(result.results[0].status, 'needs_review');
+  assert.equal(result.results[0].timeoutDetails.cliProcessState, 'exited');
+  assert.equal(result.results[0].timeoutDetails.remoteTurnState, 'reported_in_progress_by_cli');
+  assert.equal(result.results[0].turnResumable, false);
+  assert.equal(result.results[0].timeoutDetails.cliRetryable, false);
+  assert.equal(result.results[0].workerPathStatus, 'exists');
+  const recovered = await recover(root, result.batchId);
+  assert.equal(recovered.results[0].timeoutDetails.resumable, false);
+  assert.equal(recovered.results[0].status, 'needs_review');
+});
 
 test('seven simulated editors obey the configured six-worker cap and FIFO dispatch', async (t) => {
   const root = fixture();

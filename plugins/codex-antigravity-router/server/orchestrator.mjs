@@ -10,6 +10,7 @@ import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserS
 
 const exec = promisify(execFile);
 const CLI = process.env.CODEX_ANTIGRAVITY_CLI || path.join(os.homedir(), '.gemini', 'bin', process.platform === 'win32' ? 'agy.exe' : 'agy');
+const CLI_WATCHDOG_GRACE_SECONDS = 15;
 const now = () => new Date().toISOString();
 const alive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 const normalize = (p) => key(path.resolve(p));
@@ -190,7 +191,7 @@ function runCli(worker, t, model, timeout, retry, onPid, cancelFile, snap, save)
       if (process.platform === 'win32' && child.pid) exec('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true }).catch(() => child.kill());
       else child.kill();
     };
-    const timer = setTimeout(() => { timedOut = true; terminate(); }, timeout * 1000 + 15000);
+    const timer = setTimeout(() => { timedOut = true; terminate(); }, (timeout + CLI_WATCHDOG_GRACE_SECONDS) * 1000);
     const cancellation = setInterval(() => { if (fs.existsSync(cancelFile) && !cancelled) { cancelled = true; terminate(); } }, 250);
     const budget = Number(process.env.CODEX_ANTIGRAVITY_NO_EDIT_SECONDS || 0);
     const progressTimer = Number.isSafeInteger(budget) && budget > 0 && budget < timeout ? setTimeout(async () => {
@@ -223,7 +224,7 @@ function runCli(worker, t, model, timeout, retry, onPid, cancelFile, snap, save)
     child.stdout.on('data', (c) => { buffer += c; let n; while ((n = buffer.indexOf('\n')) >= 0) { line(buffer.slice(0, n)); buffer = buffer.slice(n + 1); } if (buffer.length > 4000000) buffer = ''; });
     child.stderr.on('data', (c) => { stderr = (stderr + c).slice(-3000); });
     child.on('error', (e) => { stderr = e.message; });
-    child.on('close', (code) => { closed = true; clearTimeout(timer); clearInterval(cancellation); clearTimeout(progressTimer); line(buffer); resolve({ code, timedOut, cancelled, noProgress, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length, durationMs: Date.now() - startedAt }); });
+    child.on('close', (code) => { closed = true; clearTimeout(timer); clearInterval(cancellation); clearTimeout(progressTimer); line(buffer); resolve({ code, timedOut, cancelled, noProgress, processExited: true, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length, durationMs: Date.now() - startedAt }); });
   });
 }
 export function describeDenial(denial, worker) {
@@ -246,6 +247,29 @@ export function quotaExhaustionReason(run) {
   const text = [run?.stderr, run?.result?.response, run?.result?.message, run?.result?.error, run?.result?.status].filter(Boolean).join('\n');
   if (/\b(resource_exhausted|quota[_ -]?(?:exceeded|exhausted|limit)|rate[_ -]?limit(?:ed)?|too many requests|weekly quota|usage limit reached|model quota)\b|\b429\b/i.test(text)) return text.replace(/\s+/g, ' ').slice(0, 700) || 'Antigravity reported a quota limit.';
   return null;
+}
+export function describeCliTimeout(run, timeoutSeconds) {
+  const resultText = JSON.stringify(run?.result || {});
+  const printTimedOut = /print[_ -]?timeout/i.test(resultText) || run?.result?.status === 'DEADLINE_EXCEEDED';
+  if (!run?.timedOut && !printTimedOut) return null;
+  const source = printTimedOut ? 'antigravity_print_timeout' : 'router_process_watchdog';
+  const remoteTurnState = printTimedOut ? 'reported_in_progress_by_cli' : 'unknown_after_watchdog_termination';
+  const processState = run.processExited === true ? 'exited' : run.timedOut ? 'termination_requested' : 'unknown';
+  const resultRetryable = typeof run.result?.retryable === 'boolean' ? run.result.retryable : null;
+  return {
+    source,
+    submissionTimeoutSeconds: timeoutSeconds,
+    cliPrintTimeoutSeconds: timeoutSeconds,
+    watchdogGraceSeconds: CLI_WATCHDOG_GRACE_SECONDS,
+    watchdogTerminationAtSeconds: timeoutSeconds + CLI_WATCHDOG_GRACE_SECONDS,
+    cliProcessState: processState,
+    remoteTurnState,
+    resumable: false,
+    cliRetryable: resultRetryable,
+    message: printTimedOut
+      ? `Antigravity's print timeout is the submission timeout (${timeoutSeconds}s). Its CLI process ${processState}; the CLI reported that the turn was still in progress. This router cannot resume that turn. The worker worktree is preserved for inspection; start a new task only after reviewing it.`
+      : `The router watchdog terminated the Antigravity CLI after ${timeoutSeconds + CLI_WATCHDOG_GRACE_SECONDS}s (${timeoutSeconds}s print timeout plus ${CLI_WATCHDOG_GRACE_SECONDS}s grace). The worker worktree is preserved; this router cannot resume the CLI turn.`
+  };
 }
 export function dashboardAgents() {
   const base = globalRoot(); if (!fs.existsSync(base)) return [];
@@ -340,6 +364,8 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     t.toolEvents = (t.toolEvents || 0) + (Array.isArray(run.tools) ? run.tools.length : 0);
     t.antigravityTokens = (t.antigravityTokens || 0) + (run.result?.usage?.total_tokens || 0);
     t.pid = null; t.conversationId = run.result?.conversation_id || t.conversationId; save();
+    const timeoutDetails = describeCliTimeout(run, timeout);
+    if (timeoutDetails) t.timeoutDetails = timeoutDetails;
     if (run.cancelled || fs.existsSync(cancelFile)) { t.status = 'cancelled'; break; }
     const rawReply = String(run.result?.response || '');
     t.responseCharacters = (t.responseCharacters || 0) + rawReply.length;
@@ -361,7 +387,7 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
     if (run.timedOut || run.code !== 0 || run.result?.status !== 'SUCCESS' || !cwdOk || run.denied.length || scope.length || commandTools.length) {
       t.status = 'needs_review';
       const deniedDetails = run.denied.map((denial) => describeDenial(denial, worker));
-      t.error = run.denied.length ? `CLI permission denials: ${deniedDetails.slice(0, 8).join(' | ')}` : run.timedOut ? 'CLI timeout' : !cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? `Command side effects need review: ${commandTools.map((x) => `${x.name || 'command'} (${x.state || 'state unknown'})`).join(', ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`;
+      t.error = run.denied.length ? `CLI permission denials: ${deniedDetails.slice(0, 8).join(' | ')}` : timeoutDetails?.message || (!cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? `Command side effects need review: ${commandTools.map((x) => `${x.name || 'command'} (${x.state || 'state unknown'})`).join(', ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`);
       break;
     }
     if (/^\s*ESCALATE_RISK:/i.test(reply)) { t.status = 'needs_review'; t.error = 'Worker escalated risk or scope'; break; }
@@ -390,7 +416,7 @@ async function execute(root, folder, state, t, model, timeout, save, provider, w
   else { t.status = 'completed'; state.invalidateSnapshot?.(); }
   save();
 }
-function report(state) { return { batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, setupPhase: t.setupPhase || null, workerLaunched: t.workerLaunched === true, workerPathStatus: t.worker ? (fs.existsSync(t.worker) ? 'exists' : 'planned_only') : 'unavailable', retryPossible: t.status === 'needs_review' && !t.workerLaunched && (!t.worker || !fs.existsSync(t.worker)), noProgress: t.noProgress || undefined, lastFileTool: t.lastFileTool, lastFileActivityAt: t.lastFileActivityAt, antigravityTokens: t.antigravityTokens || t.liveTokens || undefined, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
+function report(state) { return { timeoutPolicy: { submissionTimeoutSeconds: state.timeout ?? null, cliPrintTimeoutSeconds: state.timeout ?? null, controllerWatchdogGraceSeconds: CLI_WATCHDOG_GRACE_SECONDS, controllerTerminatesAtSeconds: Number.isInteger(state.timeout) ? state.timeout + CLI_WATCHDOG_GRACE_SECONDS : null, description: 'timeoutSeconds is passed directly to Antigravity --print-timeout; the router watchdog terminates the local CLI process 15 seconds later if it remains open.' }, batchId: state.batchId, cursor: state.revision || 0, workspaceRoot: state.root, stateFile: state.stateFile, model: state.model || null, maxWorkers: state.maxWorkers ?? null, maxParallel: state.maxParallel ?? null, batchStatus: state.batchStatus || null, snapshotPreparations: state.snapshotPreparations || 0, total: state.tasks.length, completed: state.tasks.filter((t) => t.status === 'completed').length, briefCharacters: state.tasks.reduce((n, t) => n + (t.briefCharacters || 0), 0), antigravityTokens: state.tasks.reduce((n, t) => n + (t.antigravityTokens || t.usage?.total_tokens || 0), 0), codexTokenUsage: null, telemetryNote: 'Codex per-call tokens are not exposed by this router; character, tool-event, repair, timeout, and duration values are proxies.', results: state.tasks.map((t) => ({ id: t.id, risk: t.risk, status: t.status, setupPhase: t.setupPhase || null, workerLaunched: t.workerLaunched === true, workerPathStatus: t.worker ? (fs.existsSync(t.worker) ? 'exists' : 'planned_only') : 'unavailable', retryPossible: t.status === 'needs_review' && !t.workerLaunched && (!t.worker || !fs.existsSync(t.worker)), noProgress: t.noProgress || undefined, lastFileTool: t.lastFileTool, lastFileActivityAt: t.lastFileActivityAt, antigravityTokens: t.antigravityTokens || t.liveTokens || undefined, attempts: t.attempts, repairRounds: Math.max(0, (t.attempts || 0) - 1), briefCharacters: t.briefCharacters || 0, responseCharacters: t.responseCharacters || 0, workerDurationMs: t.workerDurationMs || 0, snapshotDurationMs: t.snapshotDurationMs || 0, toolEvents: t.toolEvents || 0, zeroEditTimeouts: t.zeroEditTimeouts || 0, timeoutDetails: t.timeoutDetails || null, turnResumable: t.timeoutDetails ? t.timeoutDetails.resumable : null, conversationIdAvailable: Boolean(t.conversationId), changedFiles: t.changedFiles, checksPassed: t.checks?.filter((c) => c.passed).length || 0, checksFailed: t.checks?.filter((c) => !c.passed).length || 0, checks: (t.checks || []).map((c) => ({ label: c.label || 'verification check', passed: c.passed, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, durationMs: c.durationMs ?? null, stdoutTail: String(c.stdoutTail || '').slice(-1200), stderrTail: String(c.stderrTail || '').slice(-1200) })), summary: t.reply?.replace(/\[([^\]]+)\]\(file:\/\/\/[^)]+\)/g, '$1').replace(/\s+/g, ' ').slice(0, t.risk === 'HIGH_RISK' ? 600 : 240), ...(t.status !== 'completed' || t.risk === 'HIGH_RISK' ? { worker: t.worker, error: t.error, conflicts: t.conflicts } : {}) })) }; }
 async function schedule(state, folder, model, timeout, provider, workerRunner, snapshotFn = snapshot) {
   const taskVersions = new Map();
   const save = () => {
