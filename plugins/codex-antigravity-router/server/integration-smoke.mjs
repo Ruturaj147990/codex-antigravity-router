@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { delegate, integrateTask, recover, waitForBatchChange } from './orchestrator.mjs';
 import { readUserSettings } from './settings.mjs';
 
@@ -13,15 +14,18 @@ fs.writeFileSync(path.join(root, 'README.txt'), 'This repository tests isolated 
 git('add', 'README.txt');
 execFileSync('git', ['-c', 'user.name=Router Test', '-c', 'user.email=router@example.invalid', 'commit', '-qm', 'fixture'], { cwd: root, windowsHide: true });
 const count = Number(process.argv[2] || 2);
-fs.writeFileSync(path.join(root, 'input.txt'), 'context-marker\n');
+const input = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'router-smoke-input-')), 'input.txt');
+fs.writeFileSync(input, 'context-marker\n');
+const stagingScript = fileURLToPath(new URL('./stage-context.mjs', import.meta.url));
+const { contextPaths } = JSON.parse(execFileSync(process.execPath, [stagingScript, root, input], { encoding: 'utf8' }));
 if (!Number.isSafeInteger(count) || count < 1 || count > 32) throw new Error('Task count must be from 1 to 32.');
 const tasks = Array.from({ length: count }, (_, i) => {
   const file = `result-${i + 1}.txt`, value = `worker-${i + 1}`;
   return {
     id: `worker${i + 1}`, title: `Create ${file}`, risk: process.argv[3] === 'high' ? 'HIGH_RISK' : 'LOW_RISK',
     context: 'This is a controlled concurrency test in an isolated temporary Git repository.',
-    instructions: process.argv[3] === 'escalate' ? `This task requires changing ${file} and shared-config.txt together. Only ${file} is allowed. Stop without editing and start your final reply with ESCALATE_RISK: followed by the missing scope.` : `Read input.txt first. Create only ${file} with the text from input.txt, then ${value}, separated by a space and followed by a newline. Use the file writing tool. Do not run shell commands.`,
-    contextPaths: ['input.txt'], allowedPaths: [file], acceptanceCriteria: [`${file} contains ${value}`],
+    instructions: process.argv[3] === 'escalate' ? `This task requires changing ${file} and shared-config.txt together. Only ${file} is allowed. Stop without editing and start your final reply with ESCALATE_RISK: followed by the missing scope.` : `Read the supplied context file first. Create only ${file} with its text, then ${value}, separated by a space and followed by a newline. Use the file writing tool. Do not run shell commands.`,
+    contextPaths, allowedPaths: [file], acceptanceCriteria: [`${file} combines the context text with ${value}`],
     verificationCommands: [['node', '-e', process.argv[3] === 'fail' ? 'process.exit(1)' : `const fs=require('fs');if(fs.readFileSync('${file}','utf8').trim()!=='context-marker ${value}')process.exit(1)`]]
   };
 });

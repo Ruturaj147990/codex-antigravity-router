@@ -25,6 +25,8 @@ Independent verification should use focused commands supplied by Codex when feas
 
 Supply exact repository-relative files in `contextPaths`. For a sibling dataset, stage only the files the user authorizes sharing with Antigravity inside the repository and list those copies as context. For concurrent reviews, group inputs into disjoint tasks and assign separate exact output paths in `allowedPaths`. Broad overlapping output patterns can serialize the tasks.
 
+The operator can run `node server/stage-context.mjs <repository> <file> [<file> ...]` from the plugin directory. It copies the exact selected files to a new untracked folder in the repository and prints the workspace and context paths as JSON. Keep the copies available while the batch is active and exclude them from commits.
+
 After a batch finishes, use `antigravity_acknowledge_no_change` to close a reviewed failure only if its worktree has no changes. This keeps the worktree and failure history. An explicit dependency still requires a successful result.
 
 For untracked files needed as read-only context, supply repository-relative `contextPaths`. Untracked files outside `allowedPaths` and `contextPaths` are omitted from worker snapshots. Context paths do not grant permission to edit them.
