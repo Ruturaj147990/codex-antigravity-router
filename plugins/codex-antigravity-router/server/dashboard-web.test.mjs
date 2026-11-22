@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { closeBrowserDashboard, createDashboardServer, openBrowserDashboard } from './dashboard-web.mjs';
 
 test('browser dashboard serves settings and agent data and saves validated preferences', async (t) => {
@@ -18,7 +19,14 @@ test('browser dashboard serves settings and agent data and saves validated prefe
   const base = dashboard.baseUrl, headers = { authorization: 'Bearer test-secret' };
   const page = await fetch(base);
   assert.equal(page.status, 200);
-  assert.match(await page.text(), /Preferred Antigravity model/);
+  const html = await page.text();
+  assert.match(html, /Preferred Antigravity model/);
+  const policy = page.headers.get('content-security-policy');
+  assert.match(policy, /frame-ancestors 'none'/);
+  for (const [, source] of html.matchAll(/<(?:script|style)>([\s\S]*?)<\/(?:script|style)>/g)) {
+    const hash = crypto.createHash('sha256').update(source.replace(/\r\n?/g, '\n')).digest('base64');
+    assert.ok(policy.includes(`'sha256-${hash}'`));
+  }
   assert.equal((await fetch(`${base}api/dashboard`)).status, 401);
   const data = await (await fetch(`${base}api/dashboard`, { headers })).json();
   assert.deepEqual(data.models, ['gemini-3.8-flash-low', 'gemini-3.8-flash-high']);

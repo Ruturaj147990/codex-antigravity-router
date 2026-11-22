@@ -8,11 +8,21 @@ import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserS
 import { verificationReadiness } from './execution-provider.mjs';
 
 const htmlPath = fileURLToPath(new URL('./dashboard-browser.html', import.meta.url));
+const dashboardHtml = fs.readFileSync(htmlPath, 'utf8');
+const inlineHashes = (tag) => Array.from(
+  dashboardHtml.matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g')),
+  ([, source]) => `'sha256-${crypto.createHash('sha256').update(source.replace(/\r\n?/g, '\n')).digest('base64')}'`,
+).join(' ');
+const dashboardPolicy = [
+  "default-src 'none'", `script-src ${inlineHashes('script')}`, `style-src ${inlineHashes('style')}`,
+  "connect-src 'self'", "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'",
+].join('; ');
 const equalSecret = (left, right) => {
   const a = Buffer.from(String(left || '')), b = Buffer.from(String(right || ''));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 function send(res, status, body, type = 'application/json; charset=utf-8') {
+  if (type.startsWith('text/html')) res.setHeader('content-security-policy', dashboardPolicy);
   res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' });
   res.end(type.startsWith('application/json') ? JSON.stringify(body) : body);
 }
@@ -32,7 +42,7 @@ export async function createDashboardServer({ host = '127.0.0.1', port = 0, toke
       if (req.headers.origin && req.headers.origin !== origin) return send(res, 403, { error: 'Cross-origin dashboard requests are blocked.' });
       const url = new URL(req.url || '/', origin);
       if (req.method === 'GET' && url.pathname === '/health') return send(res, 204, '');
-      if (req.method === 'GET' && url.pathname === '/') return send(res, 200, fs.readFileSync(htmlPath, 'utf8'), 'text/html; charset=utf-8');
+      if (req.method === 'GET' && url.pathname === '/') return send(res, 200, dashboardHtml, 'text/html; charset=utf-8');
       if (!['/api/dashboard', '/api/settings'].includes(url.pathname)) return send(res, 404, { error: 'Not found.' });
       if (!equalSecret(req.headers.authorization, `Bearer ${token}`)) return send(res, 401, { error: 'Dashboard link expired or missing its local access token.' });
       if (req.method === 'GET' && url.pathname === '/api/dashboard') {
