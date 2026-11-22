@@ -1,10 +1,10 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-antigravity-router",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Delegate coherent engineering work to Antigravity through isolated managed Git worktrees with independent verification and guarded integration.",
   "author": {
-    "name": "Ruturaj Limbkar"
+    "name": "Ruturaj147990"
   },
   "extensions": {
     "com.openai": {
@@ -16,7 +16,7 @@
         "websiteURL": "https://antigravity-task-router.vercel.app",
         "supportURL": "https://github.com/sponsors/Ruturaj147990",
         "privacyPolicyURL": "https://antigravity-task-router.vercel.app/privacy.html",
-        "developerName": "Ruturaj Limbkar"
+        "developerName": "Ruturaj147990"
       }
     }
   },
