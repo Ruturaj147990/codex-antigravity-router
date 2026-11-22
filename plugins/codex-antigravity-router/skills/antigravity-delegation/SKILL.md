@@ -23,4 +23,8 @@ Independent verification should use focused commands supplied by Codex when feas
 
 `CODEX_ANTIGRAVITY_NO_EDIT_SECONDS` is an optional, explicit no-edit watchdog, not a general task deadline. Leave it unset for tasks that may need extended investigation or read-only work. The dashboard shows file tool activity and usage when the CLI reports them.
 
+Supply exact repository-relative files in `contextPaths`. For a sibling dataset, stage only the files the user authorizes sharing with Antigravity inside the repository and list those copies as context. For concurrent reviews, group inputs into disjoint tasks and assign separate exact output paths in `allowedPaths`. Broad overlapping output patterns can serialize the tasks.
+
+After a batch finishes, use `antigravity_acknowledge_no_change` to close a reviewed failure only if its worktree has no changes. This keeps the worktree and failure history. An explicit dependency still requires a successful result.
+
 For untracked files needed as read-only context, supply repository-relative `contextPaths`. Untracked files outside `allowedPaths` and `contextPaths` are omitted from worker snapshots. Context paths do not grant permission to edit them.

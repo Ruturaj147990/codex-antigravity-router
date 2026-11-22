@@ -70,6 +70,16 @@ test('scoped snapshots exclude unrelated untracked datasets and preserve allowed
   assert.deepEqual(await changed(worker, snap), ['out-of-scope.txt']);
 });
 
+test('snapshot splits long scoped Git arguments and deduplicates overlapping matches', async () => {
+  const root = fixture();
+  const names = Array.from({ length: 240 }, (_, i) => `dataset/image-${i}-${'a'.repeat(70)}.jpg`);
+  fs.mkdirSync(path.join(root, 'dataset'));
+  for (const name of names) fs.writeFileSync(path.join(root, name), 'fixture');
+  fs.writeFileSync(path.join(root, 'unrelated.jpg'), 'exclude');
+  const snap = await snapshot(root, ['dataset/*.jpg', ...names]);
+  assert.deepEqual(snap.untracked.toSorted(), names.toSorted());
+});
+
 test('verbose git failure retains full output and identifies its log', async (t) => {
   const root = fixture(), logs = fs.mkdtempSync(path.join(os.tmpdir(), 'router-verbose-'));
   t.after(() => fs.rmSync(logs, { recursive: true, force: true }));

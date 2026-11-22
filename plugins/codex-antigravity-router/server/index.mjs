@@ -6,7 +6,7 @@ import { availableModels, cancelTask, dashboardAgents, delegate, disposeTask, in
 import { MAX_WORKERS_LIMIT, readUserSettings, validatePreferredModel, writeUserSettings } from './settings.mjs';
 import { openBrowserDashboard } from './dashboard-web.mjs';
 import { verificationReadiness } from './execution-provider.mjs';
-import { MAX_TASK_RUNTIME_SECONDS } from './orchestrator.mjs';
+import { acknowledgeNoChange, MAX_TASK_RUNTIME_SECONDS } from './orchestrator.mjs';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const DASHBOARD_URI = 'ui://antigravity-router/dashboard-v0.7.1.html';
@@ -45,7 +45,7 @@ const task = { type: 'object', properties: {
   context: { type: 'string', description: 'Only decision-relevant context and references.' },
   instructions: { type: 'string', description: 'Coherent engineering outcome and constraints.' },
   allowedPaths: { type: 'array', items: { type: 'string' }, description: 'Bounded relative file paths or patterns. Exact paths permit concurrent editing.' },
-  contextPaths: { type: 'array', items: { type: 'string' }, description: 'Untracked files or directories needed for read-only context. Changes outside allowedPaths are rejected.' },
+  contextPaths: { type: 'array', items: { type: 'string' }, description: 'Existing exact repository-relative files needed for read-only context. Directories and globs are rejected. Changes outside allowedPaths are rejected.' },
   acceptanceCriteria: { type: 'array', items: { type: 'string' } },
   dependsOn: { type: 'array', items: { type: 'string' }, description: 'Earlier task IDs; ready tasks execute FIFO.' },
   parallelSafe: { type: 'boolean', description: 'Legacy caller hint; actual isolation and conflict checks are enforced by the controller.' },
@@ -68,6 +68,7 @@ const tools = [
     workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, taskId: { type: 'string' }
   }, required: ['workspaceRoot', 'batchId', 'taskId'], additionalProperties: false } },
   { name: 'antigravity_cancel', description: 'Request cancellation of a queued or active task while preserving its worktree and state.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, taskId: { type: 'string' } }, required: ['workspaceRoot', 'batchId', 'taskId'], additionalProperties: false } }
+  ,{ name: 'antigravity_acknowledge_no_change', description: 'Close a finished review task with no changes while preserving its worktree and failure history.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, taskId: { type: 'string' } }, required: ['workspaceRoot', 'batchId', 'taskId'], additionalProperties: false } }
   ,{ name: 'antigravity_dispose', description: 'Remove a completed or cancelled worker worktree only after confirming every worker change is preserved in the authoritative workspace.', inputSchema: { type: 'object', properties: { workspaceRoot: { type: 'string' }, batchId: { type: 'string' }, taskId: { type: 'string' } }, required: ['workspaceRoot', 'batchId', 'taskId'], additionalProperties: false } }
 ];
 const result = (value, isError = false) => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value, isError });
@@ -100,6 +101,7 @@ async function call(name, args) {
   if (name === 'antigravity_integrate') return result(await integrateTask(args.workspaceRoot, args.batchId, args.taskId));
   if (name === 'antigravity_cancel') return result(cancelTask(args.workspaceRoot, args.batchId, args.taskId));
   if (name === 'antigravity_dispose') return result(await disposeTask(args.workspaceRoot, args.batchId, args.taskId));
+  if (name === 'antigravity_acknowledge_no_change') return result(await acknowledgeNoChange(args.workspaceRoot, args.batchId, args.taskId));
   throw new Error(`Unknown tool: ${name}`);
 }
 function write(message) { process.stdout.write(`${JSON.stringify(message)}\n`); }
@@ -108,7 +110,7 @@ async function handle(message) {
   try {
     let value;
     switch (message.method) {
-      case 'initialize': value = { protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION, capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'codex-antigravity-router', version: '1.0.7' } }; break;
+      case 'initialize': value = { protocolVersion: message.params?.protocolVersion || PROTOCOL_VERSION, capabilities: { tools: {}, resources: {} }, serverInfo: { name: 'codex-antigravity-router', version: '1.0.8' } }; break;
       case 'ping': value = {}; break;
       case 'tools/list': value = { tools }; break;
       case 'resources/list': value = { resources: [{ uri: DASHBOARD_URI, name: 'Antigravity Router Dashboard', mimeType: 'text/html;profile=mcp-app' }] }; break;

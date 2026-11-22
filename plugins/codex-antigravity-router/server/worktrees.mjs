@@ -147,13 +147,36 @@ export async function snapshot(root, allowedPaths = null) {
   catch (error) { fs.closeSync(patchFd); throw error; }
   fs.closeSync(patchFd);
   const untrackedArgs = ['ls-files', '--others', '--exclude-standard', '-z'];
-  if (allowedPaths) untrackedArgs.push('--', ...allowedPaths.map((p) => `:(glob)${p}/**`), ...allowedPaths.map((p) => `:(glob)${p}`));
   const untracked = [], files = {};
   const add = (p) => {
     try { files[p] = hash(path.join(root, p)); }
     catch (error) { throw new Error(`Snapshot preparation failed at relative path ${p} (${error.code || error.name || 'I/O error'}).`); }
   };
-  await gitPaths(root, untrackedArgs, (p) => { untracked.push(p); add(p); });
+  const collect = (p) => {
+    if (Object.hasOwn(files, p)) return;
+    untracked.push(p);
+    add(p);
+  };
+  if (!allowedPaths) {
+    await gitPaths(root, untrackedArgs, collect);
+  } else {
+    // Keep each invocation below Windows' command-line limit, even when a
+    // batch supplies hundreds of exact paths. Git still evaluates the globs.
+    let specs = [], size = 0;
+    for (const p of new Set(allowedPaths)) {
+      const next = [`:(glob)${p}`, `:(glob)${p}/**`];
+      const cost = next.reduce((total, spec) => total + 2 * spec.length + 3, 0);
+      if (cost > 12000) throw new Error('A snapshot path is too long for git ls-files.');
+      if (size + cost > 12000) {
+        await gitPaths(root, [...untrackedArgs, '--', ...specs], collect);
+        specs = [];
+        size = 0;
+      }
+      specs.push(...next);
+      size += cost;
+    }
+    if (specs.length) await gitPaths(root, [...untrackedArgs, '--', ...specs], collect);
+  }
   await gitPaths(root, ['ls-files', '-z'], add);
   return { base, patchFile, untracked, files };
 }

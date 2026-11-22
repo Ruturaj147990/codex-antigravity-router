@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { delegationDefaults, resolveDelegationOptions } from './index.mjs';
+import { acknowledgeNoChange } from './orchestrator.mjs';
 import { buildAgentPrompt, buildCliArgs, cancelTask, CLI_PRINT_TIMEOUT, dashboardAgents, delegate, describeCliTimeout, describeDenial, disposeTask, integrateTask, quotaExhaustionReason, recover, waitForBatchChange } from './orchestrator.mjs';
 
 test('quota failures are classified without treating ordinary failures as exhaustion', () => {
@@ -283,6 +284,28 @@ test('print timeout and task deadline details persist in reports and recovery', 
   assert.equal(recovered.results[0].timeoutDetails.resumable, false);
   assert.equal(recovered.results[1].timeoutDetails.source, 'router_task_deadline');
   assert.equal(recovered.results[0].status, 'needs_review');
+  const worker = recovered.results[0].worker;
+  fs.writeFileSync(path.join(worker, 'late-edit.txt'), 'preserve');
+  await assert.rejects(acknowledgeNoChange(root, result.batchId, 'print_timeout'), /now has changes/);
+  fs.unlinkSync(path.join(worker, 'late-edit.txt'));
+  const closed = await acknowledgeNoChange(root, result.batchId, 'print_timeout');
+  assert.equal(closed.results[0].status, 'closed_no_change');
+  assert.equal(closed.results[0].timeoutDetails.source, 'antigravity_print_timeout');
+  assert.equal(closed.results[0].worker, worker);
+  assert.ok(fs.existsSync(worker));
+  assert.equal((await acknowledgeNoChange(root, result.batchId, 'print_timeout')).cursor, closed.cursor);
+  await assert.rejects(delegate(root, [{ ...tasks[0], contextPaths: ['.git'] }]), /existing, exact repository-relative file/);
+  const contextEdit = await delegate(root, [{
+    ...tasks[0], allowedPaths: ['README.txt'], contextPaths: ['README.txt']
+  }], {
+    workerRunner: async ({ worker: checkout }) => {
+      fs.writeFileSync(path.join(checkout, 'README.txt'), 'worker edit');
+      return { code: 0, result: { status: 'SUCCESS' }, observedCwd: checkout, denied: [], tools: [], briefCharacters: 0 };
+    }
+  });
+  assert.equal(contextEdit.results[0].status, 'needs_review');
+  assert.match(contextEdit.results[0].error, /Out-of-scope edits: README.txt/);
+  assert.equal(fs.readFileSync(path.join(root, 'README.txt'), 'utf8'), 'fixture');
 });
 
 test('seven simulated editors obey the configured six-worker cap and FIFO dispatch', async (t) => {

@@ -235,21 +235,31 @@ function runCli(worker, t, model, maxTaskRuntimeSeconds, retry, onPid, cancelFil
     child.on('close', (code) => { closed = true; clearTimeout(timer); clearInterval(cancellation); clearTimeout(progressTimer); line(buffer); resolve({ code, timedOut, cancelled, noProgress, processExited: true, result, observedCwd, denied, tools, stderr, briefCharacters: brief.length, durationMs: Date.now() - startedAt }); });
   });
 }
-export function describeDenial(denial, worker) {
+export function describeDenial(denial, worker, snapshotFiles) {
   const item = typeof denial === 'string' ? { action: denial } : denial || {};
   const identifier = (value) => typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_.:-]{0,79}$/.test(value) ? value : 'not reported';
   const target = item.path || item.scope || item.target;
   let scope = 'unspecified';
+  let snapshot = 'unknown';
   if (typeof target === 'string' && target) {
     const candidate = path.resolve(worker, target);
     const relative = path.relative(worker, candidate);
     if (path.isAbsolute(relative) || relative === '..' || relative.startsWith(`..${path.sep}`)) scope = '[outside assigned worktree]';
-    else if (relative && /^[a-zA-Z0-9_./ -]+$/.test(relative.replaceAll('\\', '/'))) scope = relative.replaceAll('\\', '/').slice(0, 180);
+    else if (relative && /^[a-zA-Z0-9_./ -]+$/.test(relative.replaceAll('\\', '/'))) {
+      const relativePath = relative.replaceAll('\\', '/');
+      scope = relativePath.slice(0, 180);
+      if (snapshotFiles) {
+        snapshot = Object.hasOwn(snapshotFiles, relativePath) && snapshotFiles[relativePath] !== null
+          ? 'file present'
+          : Object.keys(snapshotFiles).some((file) => file.startsWith(`${relativePath}/`) && snapshotFiles[file] !== null)
+            ? 'directory entries present' : 'absent';
+      }
+    }
     else scope = '[assigned worktree]';
   }
   const phase = identifier(item.phase || item.stage || item.state);
   const executed = item.executed === true ? 'yes' : item.executed === false ? 'no' : 'unknown';
-  return `${identifier(item.action || item.tool)}; server=${identifier(item.server || item.mcp_server)}; tool=${identifier(item.tool || item.tool_name)}; rule=${identifier(item.rule || item.reason)}; scope=${scope}; phase=${phase}; executed=${executed}`;
+  return `${identifier(item.action || item.tool)}; server=${identifier(item.server || item.mcp_server)}; tool=${identifier(item.tool || item.tool_name)}; rule=${identifier(item.rule || item.reason)}; scope=${scope}; phase=${phase}; executed=${executed}; snapshot=${snapshot}`;
 }
 export function quotaExhaustionReason(run) {
   const text = [run?.stderr, run?.result?.response, run?.result?.message, run?.result?.error, run?.result?.status].filter(Boolean).join('\n');
@@ -387,12 +397,13 @@ async function execute(root, folder, state, t, model, maxTaskRuntimeSeconds, sav
       stopBatchForQuota(folder, state, t, quota, save);
       return;
     }
-    const scope = edits.filter((p) => !matches(p, t.allowedPaths));
+    const contextFiles = new Set((t.contextPaths || []).map((p) => normalize(path.resolve(worker, p))));
+    const scope = edits.filter((p) => !matches(p, t.allowedPaths) || contextFiles.has(normalize(path.resolve(worker, p))));
     const cwdOk = run.observedCwd && normalize(run.observedCwd) === normalize(worker);
     const commandTools = run.tools.filter((x) => /run_command|send_command_input|notebook_execution/i.test(x.name || ''));
     if (run.timedOut || run.code !== 0 || run.result?.status !== 'SUCCESS' || !cwdOk || run.denied.length || scope.length || commandTools.length) {
       t.status = 'needs_review';
-      const deniedDetails = run.denied.map((denial) => describeDenial(denial, worker));
+      const deniedDetails = run.denied.map((denial) => describeDenial(denial, worker, snap.files));
       t.error = run.denied.length ? `CLI permission denials: ${deniedDetails.slice(0, 8).join(' | ')}` : timeoutDetails?.message || (!cwdOk ? 'CLI did not prove assigned worktree CWD' : scope.length ? `Out-of-scope edits: ${scope.join(', ')}` : commandTools.length ? `Command side effects need review: ${commandTools.map((x) => `${x.name || 'command'} (${x.state || 'state unknown'})`).join(', ')}` : run.stderr || `CLI status: ${run.result?.status || run.code}`);
       break;
     }
@@ -480,9 +491,18 @@ async function schedule(state, folder, model, maxTaskRuntimeSeconds, provider, w
       }
       if (t.status !== 'queued') continue;
       if (fs.existsSync(path.join(folder, `${t.id}.cancel`))) { t.status = 'cancelled'; save(); continue; }
-      if (t.dependsOn.some((id) => state.tasks.find((x) => x.id === id)?.status !== 'completed')) continue;
-      if (state.tasks.slice(0, index).some((x) => ['awaiting_integration', 'conflict', 'needs_review'].includes(x.status) && overlaps(x, t))) continue;
-      if ([...running].some((x) => overlaps(x, t))) continue;
+      const dependency = t.dependsOn.find((id) => state.tasks.find((x) => x.id === id)?.status !== 'completed');
+      const earlier = state.tasks.slice(0, index).find((x) =>
+        ['awaiting_integration', 'conflict', 'needs_review'].includes(x.status) &&
+        !(x.status === 'needs_review' && x.finishedAt && x.changedFiles?.length === 0) &&
+        overlaps(x, t));
+      const active = [...running].find((x) => overlaps(x, t));
+      const blockingTask = earlier || active;
+      const reason = dependency ? `Waiting for dependency ${dependency}.` : blockingTask
+        ? `Overlapping edit scopes with ${blockingTask.id}: ${t.allowedPaths.join(', ')} and ${blockingTask.allowedPaths.join(', ')}.`
+        : undefined;
+      if (t.error !== reason) { t.error = reason; save(); }
+      if (reason) continue;
       if (!claimSlot(state, t, save)) { waitingForSlot = true; break; }
       const job = withGitLogs(folder, () => execute(state.root, folder, state, t, model, maxTaskRuntimeSeconds, save, provider, workerRunner, getSnapshot)).catch((e) => { t.status = 'needs_review'; t.error = `Setup/worker phase ${t.setupPhase || 'scheduling'}: ${e.message}`; t.finishedAt = now(); save(); }).finally(() => {
         t.slotHeld = false;
@@ -496,7 +516,7 @@ async function schedule(state, folder, model, maxTaskRuntimeSeconds, provider, w
     if (waitingForSlot) pending.push(delay(100));
     await Promise.race(pending);
   }
-  for (const t of state.tasks) if (t.status === 'queued') { t.status = 'blocked'; t.error = 'A dependency or earlier overlapping task needs completion or review.'; }
+  for (const t of state.tasks) if (t.status === 'queued') { t.status = 'blocked'; t.error ||= 'A dependency or earlier overlapping task needs completion or review.'; }
   state.snapshotDurationMs = snapshotDurationMs;
   delete state.invalidateSnapshot;
   state.finishedAt = now(); state.batchStatus = 'finished'; save();
@@ -506,6 +526,12 @@ export async function delegate(root, rawTasks, options = {}) {
   const settings = readUserSettings();
   if (!settings.enabled) throw new Error('Antigravity delegation is disabled. Turn it on in the router panel or settings before delegating.');
   const tasks = validate(rawTasks);
+  for (const task of tasks) for (const relative of task.contextPaths) {
+    const target = safeFile(canonical(root), relative);
+    if (/[*?]/.test(relative) || !fs.statSync(target, { throwIfNoEntry: false })?.isFile()) {
+      throw new Error(`Task ${task.id}: contextPaths requires an existing, exact repository-relative file. "${relative}" is missing or is not a file. List the specific files needed instead of a directory or pattern.`);
+    }
+  }
   const model = options.model === undefined ? settings.model : validatePreferredModel(options.model, 'model');
   // Older callers used timeoutSeconds as a CLI print/wait timeout. Never
   // reinterpret that legacy field as permission to terminate a task.
@@ -646,6 +672,32 @@ export function cancelTask(root, batchId, taskId) {
   try { fs.writeFileSync(marker, JSON.stringify({ requestedAt: now() }), { flag: 'wx' }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   return { taskId, status: 'cancellation_requested', marker };
+}
+export async function acknowledgeNoChange(root, batchId, taskId) {
+  if (!/^[0-9a-f-]{36}$/i.test(batchId)) throw new Error('Invalid batch ID.');
+  const base = stateRoot(root);
+  const release = await waitForLock(path.join(base, 'mutation'));
+  try {
+    const file = path.join(base, batchId, 'state.json');
+    const state = load(file);
+    if (normalize(state.root) !== normalize(canonical(root))) throw new Error('Batch belongs to a different workspace.');
+    if (scheduledBatches.has(batchId) || !state.finishedAt) throw new Error('Wait for the batch to finish before acknowledging it.');
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task?.status === 'closed_no_change') return report(state);
+    if (task?.status !== 'needs_review' || task.slotHeld || alive(task.pid) || !task.finishedAt ||
+        !task.worker || !task.snapshotFile || task.changedFiles?.length !== 0) {
+      throw new Error('Only a finished review task with a confirmed empty change list can be acknowledged.');
+    }
+    if ((await changed(task.worker, load(task.snapshotFile))).length) throw new Error('The worktree now has changes. Inspect it before closing the task.');
+    if (await git(task.worker, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')) {
+      throw new Error('The worktree has ignored files. Inspect it before closing the task.');
+    }
+    task.status = 'closed_no_change';
+    task.acknowledgedAt = now();
+    task.changedAtRevision = state.revision = (state.revision || 0) + 1;
+    persist(file, state);
+    return report(state);
+  } finally { release(); }
 }
 export async function disposeTask(root, batchId, taskId) {
   const base = stateRoot(root), release = await waitForLock(path.join(base, 'mutation'));
