@@ -133,13 +133,14 @@ test('bounded delegation wait returns a durable batch handle and cursor before w
   const workerStarted = new Promise((resolve) => { startWorker = resolve; });
   const workerGate = new Promise((resolve) => { releaseWorker = resolve; });
   let workerStillRunning = false;
-  const submitted = await delegate(root, [task], { timeoutSeconds: 300, waitSeconds: 0, workerRunner: async ({ worker, maxTaskRuntimeSeconds }) => { assert.equal(maxTaskRuntimeSeconds, 0, 'legacy timeoutSeconds must not become a worker deadline'); workerStillRunning = true; startWorker(); await workerGate; fs.writeFileSync(path.join(worker, 'slow.txt'), 'done'); workerStillRunning = false; return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; } });
+  const submitted = await delegate(root, [task, { ...task, id: 'overlap' }], { maxParallel: 1, timeoutSeconds: 300, waitSeconds: 0, workerRunner: async ({ worker, maxTaskRuntimeSeconds }) => { assert.equal(maxTaskRuntimeSeconds, 0, 'legacy timeoutSeconds must not become a worker deadline'); workerStillRunning = true; startWorker(); await workerGate; fs.writeFileSync(path.join(worker, 'slow.txt'), 'done'); workerStillRunning = false; return { code: 0, result: { status: 'SUCCESS', response: 'done' }, observedCwd: worker, denied: [], tools: [], stderr: '', briefCharacters: 1 }; } });
   assert.equal(submitted.pending, true); assert.match(submitted.batchId, /^[0-9a-f-]{36}$/); assert.ok(Number.isInteger(submitted.cursor));
   assert.equal(submitted.timeoutPolicy.maxTaskRuntimeSeconds, 0);
   await workerStarted;
   const pending = await waitForBatchChange(root, submitted.batchId, submitted.cursor, 0);
   assert.equal(pending.batchId, submitted.batchId);
   assert.equal(pending.results[0].status, 'running');
+  assert.match(pending.results.find((item) => item.id === 'overlap').error, /Overlapping edit scopes with slow: slow.txt and slow.txt/);
   const unchanged = await waitForBatchChange(root, submitted.batchId, pending.cursor, 0);
   assert.equal(unchanged.batchId, submitted.batchId);
   assert.equal(unchanged.waitExpired, true);

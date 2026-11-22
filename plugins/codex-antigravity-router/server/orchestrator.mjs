@@ -179,6 +179,7 @@ export function buildAgentPrompt(worker, t, retry = '') {
     `Follow AGENTS.md. ${t.context || ''}`,
     t.instructions,
     `Allowed edits: ${t.allowedPaths.join(', ')}.`,
+    t.contextPaths?.length ? `Read-only context in the assigned worktree: ${t.contextPaths.join(', ')}. Do not edit these files.` : '',
     `Acceptance: ${t.acceptanceCriteria.join('; ')}.`,
     t.verificationCommands.length ? `Mandatory controller checks (all run in listed order): ${t.verificationCommands.map((c, i) => `${i}: ${c[0]} (${c.length - 1} arguments)`).join('; ')}. Do not call terminal, command, notebook, or code-execution tools. The controller runs every supplied check in the assigned worktree and returns bounded stdout/stderr, exit status, timeout and duration for each failure. Diagnose failures and repair the implementation.` : 'No controller check is authorized. Do not call terminal, command, notebook, or code-execution tools; report what verification is needed.',
     'Investigate root cause, implement the complete fix, and check it. Repair ordinary failures autonomously. No commit, push, destructive reset, external write, or further delegation. Preserve work. If consequential risk or out-of-scope edits are needed, stop and begin the final reply with ESCALATE_RISK: followed by the reason. Report concise changes, checks, uncertainty, and blockers.',
@@ -483,7 +484,6 @@ async function schedule(state, folder, model, maxTaskRuntimeSeconds, provider, w
   while (true) {
     let waitingForSlot = false;
     for (const [index, t] of state.tasks.entries()) {
-      if (running.size >= capacity) break;
       if (!readUserSettings().enabled) {
         for (const queued of state.tasks) if (queued.status === 'queued') { queued.status = state.autoDisabled ? 'quota_blocked' : 'disabled'; queued.error = state.autoDisabledReason || 'Delegation is disabled in router settings.'; }
         save();
@@ -500,10 +500,18 @@ async function schedule(state, folder, model, maxTaskRuntimeSeconds, provider, w
       const blockingTask = earlier || active;
       const reason = dependency ? `Waiting for dependency ${dependency}.` : blockingTask
         ? `Overlapping edit scopes with ${blockingTask.id}: ${t.allowedPaths.join(', ')} and ${blockingTask.allowedPaths.join(', ')}.`
-        : undefined;
-      if (t.error !== reason) { t.error = reason; save(); }
-      if (reason) continue;
-      if (!claimSlot(state, t, save)) { waitingForSlot = true; break; }
+        : running.size >= capacity ? `Waiting for a batch worker slot (effective concurrency: ${capacity}).` : undefined;
+      if (reason) {
+        if (t.error !== reason) { t.error = reason; save(); }
+        continue;
+      }
+      if (!claimSlot(state, t, save)) {
+        const slotReason = 'Waiting for a shared Antigravity worker slot.';
+        if (t.error !== slotReason) { t.error = slotReason; save(); }
+        waitingForSlot = true;
+        break;
+      }
+      delete t.error;
       const job = withGitLogs(folder, () => execute(state.root, folder, state, t, model, maxTaskRuntimeSeconds, save, provider, workerRunner, getSnapshot)).catch((e) => { t.status = 'needs_review'; t.error = `Setup/worker phase ${t.setupPhase || 'scheduling'}: ${e.message}`; t.finishedAt = now(); save(); }).finally(() => {
         t.slotHeld = false;
         running.delete(t);
